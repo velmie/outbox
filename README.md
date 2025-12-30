@@ -610,9 +610,9 @@ below is mostly durability and storage cost.
 | Fast      | tmpfs, relaxed durability | ~51k msg/s (8x100)  | ~18.7k msg/s (~10 ms) | ~36k msg/s   |
 
 Raw insert baseline (`use_tx=false`) is ~211 msg/s (prod-like) and ~53k msg/s (fast).
-Full reports: `docs/benchmarks/results/20251225T225119Z/report.md` and
-`docs/benchmarks/results/20251228T165819Z/report.md`.
-Reproduce: `docs/benchmarks.md`.
+Full reports: [docs/benchmarks/results/20251225T225119Z/report.md](docs/benchmarks/results/20251225T225119Z/report.md) and
+[docs/benchmarks/results/20251228T165819Z/report.md](docs/benchmarks/results/20251228T165819Z/report.md).
+Reproduce: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Docs
 
