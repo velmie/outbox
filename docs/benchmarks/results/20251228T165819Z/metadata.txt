@@ -1,0 +1,33 @@
+# Benchmark config
+run_id=20251228T165819Z
+plan=full
+records_consume=200000
+records_enqueue=200000
+records_mixed=200000
+partition_ahead=168h
+partition_lookback=0s
+partition_window=1h
+partition_effect_records=2000000
+partition_effect_days=90
+partition_effect_seed_age=2160h
+partition_effect_lookback=2160h
+large_payload_records=20000
+auto_target=1
+mixed_drain_timeout=2m
+mixed_enabled=1
+repeats=3
+warmup=1
+warmup_records=20000
+
+# MySQL config
+mysql_version=8.0.36
+innodb_flush_log_at_trx_commit=2
+sync_binlog=0
+innodb_buffer_pool_size=1073741824
+innodb_log_file_size=536870912
+innodb_io_capacity=5000
+
+# Host
+cpu_model=12th Gen Intel(R) Core(TM) i7-12700H
+cpu_threads=20
+ram_total=31Gi
