@@ -49,7 +49,7 @@ library with minimal noise.
 
 ## 2. Modes: consume, enqueue, mixed
 
-The benchmark executable (`./cmd/outbox-bench`) supports three modes:
+The benchmark executable lives in `cmd/outbox-bench` and supports three modes:
 
 ### Consume mode
 

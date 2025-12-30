@@ -15,7 +15,10 @@ Requires Go 1.24+.
 
 ```bash
 go get github.com/velmie/outbox
+go get github.com/velmie/outbox/mysql
 ```
+
+Install `github.com/velmie/outbox/mysql` when you use the MySQL adapter.
 
 ## Quick Start
 
@@ -334,7 +337,8 @@ func main() {
 CLI usage (run on schedule with a DB user that can `ALTER`):
 
 ```bash
-go run ./cmd/outbox-partitions \
+cd cmd/outbox-partitions
+go run . \
   -dsn "user:pass@tcp(localhost:3306)/app?parseTime=true" \
   -table outbox \
   -period day \
@@ -452,7 +456,8 @@ func main() {
 ```
 
 ```bash
-go run ./cmd/outbox-cleanup \
+cd cmd/outbox-cleanup
+go run . \
   -dsn "user:pass@tcp(localhost:3306)/app?parseTime=true" \
   -table outbox \
   -retention 168h \
@@ -623,12 +628,13 @@ go test -tags=integration ./...
 ```
 
 Integration tests use testcontainers and require Docker.
-CLI integration tests for `cmd/outbox-cleanup` and `cmd/outbox-partitions` build the binaries and run them in a container against a real MySQL container.
+CLI integration tests in `cmd/outbox-cleanup` and `cmd/outbox-partitions` build the binaries and run them in a container against a real MySQL container.
 
 Run only the CLI integration tests:
 
 ```bash
-go test -tags=integration -timeout 5m ./cmd/outbox-cleanup ./cmd/outbox-partitions
+cd cmd
+go test -tags=integration -timeout 5m ./outbox-cleanup ./outbox-partitions
 ```
 
 ## Lint

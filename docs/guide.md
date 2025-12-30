@@ -249,7 +249,8 @@ go func() {
 Use the CLI when `ALTER` privileges cannot be granted to the app or when you want a dedicated ops job:
 
 ```bash
-go run ./cmd/outbox-partitions \
+cd cmd/outbox-partitions
+go run . \
   -dsn "user:pass@tcp(localhost:3306)/app?parseTime=true" \
   -table outbox \
   -period day \
@@ -298,7 +299,8 @@ go func() {
 Standalone CLI (cron / CronJob):
 
 ```bash
-go run ./cmd/outbox-cleanup \
+cd cmd/outbox-cleanup
+go run . \
   -dsn "user:pass@tcp(localhost:3306)/app?parseTime=true" \
   -table outbox \
   -retention 168h \
