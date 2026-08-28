@@ -35,13 +35,14 @@ const (
 )
 
 const (
+	dsnEnvName              = "OUTBOX_DSN"
 	defaultRecords          = 100000
 	defaultPayloadBytes     = 512
 	defaultWorkers          = 4
 	defaultProducers        = 4
 	defaultBatchSize        = 50
 	defaultPartitionAhead   = 7 * 24 * time.Hour
-	defaultPartitionWindow  = time.Hour
+	defaultPartitionWindow  = 0
 	defaultDrainTimeout     = 2 * time.Minute
 	defaultProgressInterval = 10 * time.Second
 	defaultSeedBatchSize    = 1000
@@ -59,17 +60,15 @@ const (
 )
 
 var (
-	errDSNRequired              = errors.New("outbox-bench: dsn is required")
-	errMixedConfigMissing       = errors.New("outbox-bench: mixed mode requires records > 0 or mixed-duration")
-	errUnsupportedMode          = errors.New("outbox-bench: unsupported mode")
-	errInvalidMode              = errors.New("outbox-bench: invalid mode")
-	errInvalidPeriod            = errors.New("outbox-bench: invalid partition period")
-	errTableRequired            = errors.New("outbox-bench: table is required")
-	errInvalidTableName         = errors.New("outbox-bench: invalid table name")
-	errProcessedMismatch        = errors.New("outbox-bench: processed records mismatch")
-	errPartitionWindowNoOverlap = errors.New("outbox-bench: partition window does not overlap seeded data")
-	errNoVisibleRecords         = errors.New("outbox-bench: no visible records for consume run")
-	errTargetMismatch           = errors.New("outbox-bench: requested records exceed visible rows")
+	errDSNRequired        = errors.New("outbox-bench: OUTBOX_DSN or -dsn is required")
+	errMixedConfigMissing = errors.New("outbox-bench: mixed mode requires records > 0 or mixed-duration")
+	errUnsupportedMode    = errors.New("outbox-bench: unsupported mode")
+	errInvalidMode        = errors.New("outbox-bench: invalid mode")
+	errInvalidPeriod      = errors.New("outbox-bench: invalid partition period")
+	errTableRequired      = errors.New("outbox-bench: table is required")
+	errInvalidTableName   = errors.New("outbox-bench: invalid table name")
+	errProcessedMismatch  = errors.New("outbox-bench: processed records mismatch")
+	errNoPendingRecords   = errors.New("outbox-bench: no pending records for consume run")
 )
 
 type result struct {
@@ -169,7 +168,7 @@ func main() {
 		jsonOut           bool
 	)
 
-	flag.StringVar(&dsn, "dsn", "", "MySQL DSN, e.g. user:pass@tcp(host:3306)/db?parseTime=true")
+	flag.StringVar(&dsn, "dsn", "", "Deprecated: set OUTBOX_DSN")
 	flag.StringVar(&table, "table", "outbox_bench", "Outbox table name")
 	flag.StringVar(&runMode, "mode", "consume", "Benchmark mode: consume, enqueue, or mixed")
 	flag.IntVar(&records, "records", defaultRecords, "Number of records to process")
@@ -183,7 +182,7 @@ func main() {
 	flag.StringVar(&partitionPeriod, "partition-period", "day", "Partition period: day or month")
 	flag.DurationVar(&partitionAhead, "partition-ahead", defaultPartitionAhead, "How far ahead to create partitions")
 	flag.DurationVar(&partitionLookback, "partition-lookback", 0, "How far back to create partitions")
-	flag.DurationVar(&partitionWindow, "partition-window", defaultPartitionWindow, "Relay partition window (0 disables)")
+	flag.DurationVar(&partitionWindow, "partition-window", defaultPartitionWindow, "Deprecated: ignored")
 	flag.DurationVar(&producerInterval, "producer-interval", 0, "Sleep between enqueues per producer (mixed mode)")
 	flag.DurationVar(&mixedDuration, "mixed-duration", 0, "Mixed mode duration (0 uses records)")
 	flag.DurationVar(&drainTimeout, "drain-timeout", defaultDrainTimeout, "Time to wait for consumers to drain (mixed mode)")
@@ -195,9 +194,10 @@ func main() {
 	flag.BoolVar(&measureLatency, "measure-latency", true, "Measure end-to-end latency in mixed mode")
 	flag.BoolVar(&progress, "progress", true, "Emit progress updates to stderr")
 	flag.DurationVar(&progressInterval, "progress-interval", defaultProgressInterval, "Progress update interval")
-	flag.BoolVar(&autoTarget, "auto-target", true, "Adjust consume target to visible pending rows")
+	flag.BoolVar(&autoTarget, "auto-target", true, "Adjust consume target to pending rows")
 	flag.BoolVar(&jsonOut, "json", false, "Print JSON result")
 	flag.Parse()
+	dsn = resolveDSN(dsn)
 
 	if dsn == "" {
 		exitErr(errDSNRequired)
@@ -377,54 +377,11 @@ type benchConfig struct {
 	autoTarget        bool
 }
 
-func validateConsumeWindow(cfg benchConfig) error {
-	if cfg.partitionWindow <= 0 {
-		return nil
-	}
-
-	seedAge := cfg.seedAge
-	if seedAge < 0 {
-		seedAge = 0
-	}
-	seedDays := cfg.seedDays
-	if seedDays <= 0 {
-		seedDays = 1
-	}
-	if seedAge == 0 && seedDays <= 1 {
-		return nil
-	}
-
-	newestAge := seedAge
-	if seedDays > 1 {
-		newestAge = seedAge - time.Duration(seedDays-1)*time.Duration(hoursPerDay)*time.Hour
-		if newestAge < 0 {
-			newestAge = 0
-		}
-	}
-	if newestAge > cfg.partitionWindow {
-		return fmt.Errorf(
-			"%w: partition-window=%s newest-age=%s seed-age=%s seed-days=%d",
-			errPartitionWindowNoOverlap,
-			cfg.partitionWindow,
-			newestAge,
-			seedAge,
-			seedDays,
-		)
-	}
-
-	return nil
-}
-
-func countVisiblePending(ctx context.Context, db *sql.DB, table string, minCreatedAt time.Time) (int64, error) {
+func countPending(ctx context.Context, db *sql.DB, table string) (int64, error) {
 	var count int64
 	query := "SELECT COUNT(*) FROM " + table + " WHERE status = ?"
-	args := []any{outbox.StatusPending}
-	if !minCreatedAt.IsZero() {
-		query += " AND created_ts >= ?"
-		args = append(args, minCreatedAt.UTC().Unix())
-	}
-	if err := db.QueryRowContext(ctx, query, args...).Scan(&count); err != nil {
-		return 0, fmt.Errorf("outbox-bench: count visible pending failed: %w", err)
+	if err := db.QueryRowContext(ctx, query, outbox.StatusPending).Scan(&count); err != nil {
+		return 0, fmt.Errorf("outbox-bench: count pending failed: %w", err)
 	}
 
 	return count, nil
@@ -432,34 +389,25 @@ func countVisiblePending(ctx context.Context, db *sql.DB, table string, minCreat
 
 func resolveConsumeTargets(ctx context.Context, db *sql.DB, cfg benchConfig) (targetRecords, visibleRecords int64, err error) {
 	targetRecords = int64(cfg.records)
-	if !cfg.autoTarget && cfg.partitionWindow <= 0 {
+	if !cfg.autoTarget {
 		visibleRecords = targetRecords
 
 		return targetRecords, visibleRecords, nil
 	}
 
-	minCreatedAt := time.Time{}
-	if cfg.partitionWindow > 0 {
-		minCreatedAt = time.Now().UTC().Add(-cfg.partitionWindow)
-	}
-	visibleRecords, err = countVisiblePending(ctx, db, cfg.table, minCreatedAt)
+	visibleRecords, err = countPending(ctx, db, cfg.table)
 	if err != nil {
 		return 0, 0, err
 	}
 	if visibleRecords == 0 {
-		return 0, 0, fmt.Errorf("%w: partition-window=%s", errNoVisibleRecords, cfg.partitionWindow)
+		return 0, 0, errNoPendingRecords
 	}
 	if visibleRecords < int64(cfg.records) {
-		if !cfg.autoTarget {
-			return 0, 0, fmt.Errorf("%w: requested=%d visible=%d partition-window=%s",
-				errTargetMismatch, cfg.records, visibleRecords, cfg.partitionWindow)
-		}
 		fmt.Fprintf(
 			os.Stderr,
-			"outbox-bench: auto-target adjusted from %d to %d visible rows (partition-window=%s)\n",
+			"outbox-bench: auto-target adjusted from %d to %d pending rows\n",
 			cfg.records,
 			visibleRecords,
-			cfg.partitionWindow,
 		)
 		targetRecords = visibleRecords
 	}
@@ -469,9 +417,6 @@ func resolveConsumeTargets(ctx context.Context, db *sql.DB, cfg benchConfig) (ta
 
 func runConsume(db *sql.DB, store *mysql.Store, cfg benchConfig) (result, error) {
 	ctx := context.Background()
-	if err := validateConsumeWindow(cfg); err != nil {
-		return result{}, err
-	}
 	seedStart := time.Now()
 	if err := seedEntries(ctx, db, store, cfg.records, cfg.payload, defaultSeedBatchSize, cfg.seedAge, cfg.seedDays); err != nil {
 		return result{}, err
@@ -495,10 +440,6 @@ func runConsume(db *sql.DB, store *mysql.Store, cfg benchConfig) (result, error)
 		outbox.WithPollInterval(0),
 		outbox.WithMetrics(metrics),
 	}
-	if cfg.partitionWindow > 0 {
-		opts = append(opts, outbox.WithPartitionWindow(cfg.partitionWindow))
-	}
-
 	relay := outbox.NewRelay(store, handler, opts...)
 	progress := newProgressPrinter(cfg.progress, cfg.progressInterval)
 	if progress.Enabled() {
@@ -829,10 +770,6 @@ func startRelay(ctx context.Context, store *mysql.Store, cfg benchConfig, handle
 		outbox.WithPollInterval(0),
 		outbox.WithMetrics(metrics),
 	}
-	if cfg.partitionWindow > 0 {
-		opts = append(opts, outbox.WithPartitionWindow(cfg.partitionWindow))
-	}
-
 	relay := outbox.NewRelay(store, handler, opts...)
 	errCh := make(chan error, 1)
 	go func() {
@@ -1531,7 +1468,7 @@ func consumeProgress(ctx context.Context, printer *progressPrinter, cfg benchCon
 				percent = float64(current) / float64(target) * percentScale
 			}
 			line := fmt.Sprintf(
-				"consume: %d/%d (%.1f%%) rate=%.0f/s stall=%s workers=%d batch=%d window=%s",
+				"consume: %d/%d (%.1f%%) rate=%.0f/s stall=%s workers=%d batch=%d",
 				current,
 				target,
 				percent,
@@ -1539,7 +1476,6 @@ func consumeProgress(ctx context.Context, printer *progressPrinter, cfg benchCon
 				shortDuration(now.Sub(lastChange)),
 				cfg.workers,
 				cfg.batchSize,
-				shortDuration(cfg.partitionWindow),
 			)
 			printer.Print(line)
 		}
@@ -1554,13 +1490,12 @@ func progressConsumeDoneLine(cfg benchConfig, metrics *benchMetrics, target int6
 	}
 
 	return fmt.Sprintf(
-		"consume: %d/%d (%.1f%%) done workers=%d batch=%d window=%s",
+		"consume: %d/%d (%.1f%%) done workers=%d batch=%d",
 		current,
 		target,
 		percent,
 		cfg.workers,
 		cfg.batchSize,
-		shortDuration(cfg.partitionWindow),
 	)
 }
 
@@ -1772,6 +1707,14 @@ func sanitizeTableName(name string) (string, error) {
 	}
 
 	return name, nil
+}
+
+func resolveDSN(flagValue string) string {
+	if flagValue != "" {
+		return flagValue
+	}
+
+	return os.Getenv(dsnEnvName)
 }
 
 func exitErr(err error) {

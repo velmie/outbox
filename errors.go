@@ -21,8 +21,15 @@ var (
 	ErrInvalidPayload = errors.New("outbox payload must be valid JSON")
 	// ErrInvalidHeaders is returned when Entry.Headers is not valid JSON.
 	ErrInvalidHeaders = errors.New("outbox headers must be valid JSON")
-	// ErrInvalidID is returned when parsing or scanning an ID fails.
+	// ErrInvalidID is returned when parsing, scanning, or validating an ID fails.
 	ErrInvalidID = errors.New("outbox id is invalid")
 	// ErrWorkerPanic indicates a relay worker panic.
+	// The error does not include the recovered panic value.
 	ErrWorkerPanic = errors.New("outbox worker panic")
+)
+
+var (
+	errHandlerFailed   = errors.New("outbox handler failed")
+	errHandlerPanicked = errors.New("outbox handler panicked")
+	errHandlerTimedOut = errors.New("outbox handler timed out")
 )

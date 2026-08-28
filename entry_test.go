@@ -2,6 +2,7 @@ package outbox
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 )
 
@@ -88,5 +89,45 @@ func TestValidateEntryWithOptions(t *testing.T) {
 	}
 	if err := ValidateEntryWithOptions(entry, false, false); err != nil {
 		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestEntryValidateID(t *testing.T) {
+	valid, err := ParseID("017f22e2-79b0-7cc3-98c4-dc0c0c07398f")
+	if err != nil {
+		t.Fatalf("parse valid UUIDv7: %v", err)
+	}
+	wrongVersion := valid
+	wrongVersion[6] = (wrongVersion[6] & 0x0f) | 0x40
+	wrongVariant00 := valid
+	wrongVariant00[8] &= 0x3f
+	wrongVariant11 := valid
+	wrongVariant11[8] |= 0xc0
+
+	tests := []struct {
+		name string
+		id   ID
+		err  error
+	}{
+		{name: "generated", id: ID{}},
+		{name: "old UUIDv7", id: valid},
+		{name: "wrong version", id: wrongVersion, err: ErrInvalidID},
+		{name: "wrong variant 00", id: wrongVariant00, err: ErrInvalidID},
+		{name: "wrong variant 11", id: wrongVariant11, err: ErrInvalidID},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			entry := Entry{
+				ID:            test.id,
+				AggregateType: "order",
+				EventType:     "created",
+				Payload:       json.RawMessage(`{"id":1}`),
+			}
+			err := entry.Validate()
+			if !errors.Is(err, test.err) {
+				t.Fatalf("error = %v, want %v", err, test.err)
+			}
+		})
 	}
 }

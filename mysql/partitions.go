@@ -3,6 +3,7 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -17,6 +18,10 @@ const (
 	defaultPartitionLookaheadMonth = 90 * 24 * time.Hour
 	defaultPartitionCheckEvery     = time.Hour
 	defaultPartitionLockPrefix     = "outbox:partitions:"
+	partitionLockCleanupTimeout    = 5 * time.Second
+	partitionEngine                = "InnoDB"
+	partitionMethod                = "RANGE"
+	partitionExpression            = "created_ts"
 	qualifiedTableParts            = 2
 )
 
@@ -40,9 +45,9 @@ type PartitionMaintainerConfig struct {
 	Lookahead time.Duration
 	// CheckEvery is the interval between partition checks.
 	CheckEvery time.Duration
-	// LockName is the advisory lock name. Defaults to outbox:partitions:<table>.
+	// LockName is the 1-to-64-character advisory lock name. Defaults to outbox:partitions:<table>.
 	LockName string
-	// Retention drops partitions older than now-retention (0 disables dropping).
+	// Retention drops terminal-only partitions older than now-retention (0 disables dropping).
 	Retention time.Duration
 	// Clock overrides time source (useful for tests).
 	Clock outbox.Clock
@@ -71,9 +76,9 @@ type PartitionMaintainer struct {
 //		log.Fatal(err)
 //	}
 //
-//	go func() {
-//		_ = maintainer.Run(ctx)
-//	}()
+//	if err := maintainer.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+//		log.Fatal(err)
+//	}
 func NewPartitionMaintainer(db *sql.DB, cfg PartitionMaintainerConfig) (*PartitionMaintainer, error) {
 	if db == nil {
 		return nil, ErrDBRequired
@@ -106,6 +111,9 @@ func NewPartitionMaintainer(db *sql.DB, cfg PartitionMaintainerConfig) (*Partiti
 	if cfg.LockName == "" {
 		cfg.LockName = defaultPartitionLockPrefix + cfg.Table
 	}
+	if err := validateNamedLockName(cfg.LockName); err != nil {
+		return nil, err
+	}
 	if cfg.Retention < 0 {
 		return nil, ErrPartitionRetentionInvalid
 	}
@@ -135,14 +143,14 @@ func (m *PartitionMaintainer) Run(ctx context.Context) error {
 }
 
 // Ensure creates missing partitions ahead of time and optionally drops old ones.
-func (m *PartitionMaintainer) Ensure(ctx context.Context) error {
+func (m *PartitionMaintainer) Ensure(ctx context.Context) (err error) {
 	conn, err := m.db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("outbox mysql: partition conn failed: %w", err)
 	}
 	defer conn.Close()
 
-	locked, err := m.tryLock(ctx, conn)
+	locked, err := tryNamedLock(ctx, conn, m.cfg.LockName)
 	if err != nil {
 		return err
 	}
@@ -151,7 +159,9 @@ func (m *PartitionMaintainer) Ensure(ctx context.Context) error {
 
 		return nil
 	}
-	defer m.releaseLock(ctx, conn)
+	defer func() {
+		err = errors.Join(err, releaseNamedLock(ctx, conn, m.cfg.LockName))
+	}()
 
 	schema, table, err := resolveSchemaTable(ctx, conn, m.cfg.Table)
 	if err != nil {
@@ -177,7 +187,7 @@ func (m *PartitionMaintainer) Ensure(ctx context.Context) error {
 		}
 	}
 	if len(plan.drop) > 0 {
-		if err := m.dropPartitions(ctx, conn, plan.drop); err != nil {
+		if err := m.dropPartitions(ctx, conn, schema, table); err != nil {
 			return err
 		}
 	}
@@ -202,26 +212,23 @@ type partitionPlan struct {
 	drop []string
 }
 
-func (m *PartitionMaintainer) tryLock(ctx context.Context, conn *sql.Conn) (bool, error) {
-	var got sql.NullInt64
-	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, 0)", m.cfg.LockName).Scan(&got); err != nil {
-		return false, fmt.Errorf("outbox mysql: acquire lock failed: %w", err)
-	}
-	if !got.Valid || got.Int64 == 0 {
-		return false, nil
-	}
-
-	return true, nil
-}
-
-func (m *PartitionMaintainer) releaseLock(ctx context.Context, conn *sql.Conn) {
-	var released sql.NullInt64
-	if err := conn.QueryRowContext(ctx, "SELECT RELEASE_LOCK(?)", m.cfg.LockName).Scan(&released); err != nil {
-		m.cfg.Logger.Warn("outbox partitions release lock failed", "err", err)
-	}
-}
+var errPartitionRetentionBlocked = errors.New("outbox mysql: partition retention blocked by non-terminal records")
 
 func (m *PartitionMaintainer) reorganizeMax(ctx context.Context, conn *sql.Conn, maxName string, add []partitionDef) error {
+	quotedMaxName, err := quotePartitionName(maxName)
+	if err != nil {
+		return err
+	}
+	parts := make([]string, 0, len(add)+1)
+	for _, part := range add {
+		quotedName, err := quotePartitionName(part.name)
+		if err != nil {
+			return err
+		}
+		parts = append(parts, fmt.Sprintf("PARTITION %s VALUES LESS THAN (%d)", quotedName, part.upperBound))
+	}
+	parts = append(parts, fmt.Sprintf("PARTITION %s VALUES LESS THAN (MAXVALUE)", quotedMaxName))
+
 	m.cfg.Logger.Info(
 		"outbox partitions reorganize",
 		"table",
@@ -231,17 +238,12 @@ func (m *PartitionMaintainer) reorganizeMax(ctx context.Context, conn *sql.Conn,
 		"add",
 		partitionDefNames(add),
 	)
-	parts := make([]string, 0, len(add)+1)
-	for _, part := range add {
-		parts = append(parts, fmt.Sprintf("PARTITION %s VALUES LESS THAN (%d)", part.name, part.upperBound))
-	}
-	parts = append(parts, fmt.Sprintf("PARTITION %s VALUES LESS THAN (MAXVALUE)", maxName))
 
 	// #nosec G201 -- table and partition names are sanitized.
 	stmt := fmt.Sprintf(
 		"ALTER TABLE %s REORGANIZE PARTITION %s INTO (%s)",
 		m.cfg.Table,
-		maxName,
+		quotedMaxName,
 		strings.Join(parts, ", "),
 	)
 	if _, err := conn.ExecContext(ctx, stmt); err != nil {
@@ -251,23 +253,61 @@ func (m *PartitionMaintainer) reorganizeMax(ctx context.Context, conn *sql.Conn,
 	return nil
 }
 
-func (m *PartitionMaintainer) dropPartitions(ctx context.Context, conn *sql.Conn, names []string) error {
-	if len(names) == 0 {
+func (m *PartitionMaintainer) dropPartitions(
+	ctx context.Context,
+	conn *sql.Conn,
+	schema, table string,
+) error {
+	var dropped []string
+	err := withPartitionWriteLock(ctx, conn, m.cfg.Table, func() error {
+		info, err := loadPartitions(ctx, conn, schema, table)
+		if err != nil {
+			return err
+		}
+		plan, err := planPartitionChanges(m.cfg, info)
+		if err != nil {
+			return err
+		}
+		if len(plan.drop) == 0 {
+			return nil
+		}
+
+		quotedNames, err := quotePartitionNames(plan.drop)
+		if err != nil {
+			return err
+		}
+		blocked, err := partitionsContainNonTerminal(ctx, conn, m.cfg.Table, quotedNames)
+		if err != nil {
+			return err
+		}
+		if blocked {
+			return fmt.Errorf("%w in %s", errPartitionRetentionBlocked, strings.Join(plan.drop, ", "))
+		}
+
+		// #nosec G201 -- table and partition names are sanitized.
+		stmt := fmt.Sprintf(
+			"ALTER TABLE %s ALGORITHM=INPLACE, LOCK=EXCLUSIVE, DROP PARTITION %s",
+			m.cfg.Table,
+			strings.Join(quotedNames, ", "),
+		)
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("outbox mysql: drop partitions failed: %w", err)
+		}
+		dropped = plan.drop
+
 		return nil
-	}
-	m.cfg.Logger.Info(
-		"outbox partitions drop",
-		"table",
-		m.cfg.Table,
-		"partitions",
-		names,
-	)
-	stmt := fmt.Sprintf("ALTER TABLE %s DROP PARTITION %s", m.cfg.Table, strings.Join(names, ", "))
-	if _, err := conn.ExecContext(ctx, stmt); err != nil {
-		return fmt.Errorf("outbox mysql: drop partitions failed: %w", err)
+	})
+	if len(dropped) > 0 {
+		m.cfg.Logger.Info(
+			"outbox partitions drop",
+			"table",
+			m.cfg.Table,
+			"partitions",
+			dropped,
+		)
 	}
 
-	return nil
+	return err
 }
 
 func resolveSchemaTable(ctx context.Context, conn *sql.Conn, table string) (schema, tableName string, err error) {
@@ -291,10 +331,18 @@ func resolveSchemaTable(ctx context.Context, conn *sql.Conn, table string) (sche
 
 func loadPartitions(ctx context.Context, conn *sql.Conn, schema, table string) (partitionInfo, error) {
 	rows, err := conn.QueryContext(ctx, `
-SELECT PARTITION_NAME, PARTITION_DESCRIPTION
-FROM information_schema.PARTITIONS
-WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND PARTITION_NAME IS NOT NULL
-ORDER BY PARTITION_ORDINAL_POSITION
+SELECT
+    t.ENGINE,
+    p.PARTITION_NAME,
+    p.PARTITION_DESCRIPTION,
+    p.PARTITION_METHOD,
+    p.PARTITION_EXPRESSION,
+    p.SUBPARTITION_METHOD
+FROM information_schema.PARTITIONS AS p
+JOIN information_schema.TABLES AS t
+  ON t.TABLE_SCHEMA = p.TABLE_SCHEMA AND t.TABLE_NAME = p.TABLE_NAME
+WHERE p.TABLE_SCHEMA = ? AND p.TABLE_NAME = ?
+ORDER BY p.PARTITION_ORDINAL_POSITION
 `, schema, table)
 	if err != nil {
 		return partitionInfo{}, fmt.Errorf("outbox mysql: list partitions failed: %w", err)
@@ -307,14 +355,21 @@ ORDER BY PARTITION_ORDINAL_POSITION
 	}
 	for rows.Next() {
 		var (
-			name sql.NullString
-			desc sql.NullString
+			engine             sql.NullString
+			name               sql.NullString
+			desc               sql.NullString
+			method             sql.NullString
+			expression         sql.NullString
+			subpartitionMethod sql.NullString
 		)
-		if err := rows.Scan(&name, &desc); err != nil {
+		if err := rows.Scan(&engine, &name, &desc, &method, &expression, &subpartitionMethod); err != nil {
 			return partitionInfo{}, fmt.Errorf("outbox mysql: scan partitions failed: %w", err)
 		}
-		if !name.Valid || name.String == "" {
-			continue
+		if !validPartitionMetadata(engine, name, method, expression, subpartitionMethod) {
+			return partitionInfo{}, ErrPartitionedTableRequired
+		}
+		if _, err := quotePartitionName(name.String); err != nil {
+			return partitionInfo{}, err
 		}
 		if !desc.Valid || desc.String == "" {
 			return partitionInfo{}, ErrPartitionDescriptionInvalid
@@ -349,6 +404,126 @@ ORDER BY PARTITION_ORDINAL_POSITION
 	}
 
 	return info, nil
+}
+
+func withPartitionWriteLock(
+	ctx context.Context,
+	conn *sql.Conn,
+	table string,
+	action func() error,
+) (err error) {
+	var originalAutocommit int
+	if err := conn.QueryRowContext(ctx, "SELECT @@SESSION.autocommit").Scan(&originalAutocommit); err != nil {
+		return fmt.Errorf("outbox mysql: inspect partition autocommit failed: %w", err)
+	}
+
+	restoreAutocommit := originalAutocommit != 0
+	if restoreAutocommit {
+		if _, err := conn.ExecContext(ctx, "SET SESSION autocommit = 0"); err != nil {
+			return fmt.Errorf("outbox mysql: disable partition autocommit failed: %w", err)
+		}
+	}
+
+	locked := false
+	defer func() {
+		cleanupErr := finishPartitionWriteLock(ctx, conn, locked, restoreAutocommit)
+		if cleanupErr != nil {
+			discardConnection(conn)
+			err = errors.Join(err, cleanupErr)
+		}
+	}()
+
+	// #nosec G201 -- table is sanitized by NewPartitionMaintainer.
+	stmt := fmt.Sprintf("LOCK TABLES %s WRITE", table)
+	if _, err := conn.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("outbox mysql: lock partition table failed: %w", err)
+	}
+	locked = true
+
+	return action()
+}
+
+func finishPartitionWriteLock(
+	ctx context.Context,
+	conn *sql.Conn,
+	locked, restoreAutocommit bool,
+) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), partitionLockCleanupTimeout)
+	defer cancel()
+
+	var cleanupErr error
+	if locked {
+		if _, err := conn.ExecContext(cleanupCtx, "COMMIT"); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("outbox mysql: commit partition lock failed: %w", err))
+		}
+		if _, err := conn.ExecContext(cleanupCtx, "UNLOCK TABLES"); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("outbox mysql: unlock partition table failed: %w", err))
+		}
+	}
+	if restoreAutocommit {
+		if _, err := conn.ExecContext(cleanupCtx, "SET SESSION autocommit = 1"); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("outbox mysql: restore partition autocommit failed: %w", err))
+		}
+	}
+
+	return cleanupErr
+}
+
+func partitionsContainNonTerminal(
+	ctx context.Context,
+	conn *sql.Conn,
+	table string,
+	quotedNames []string,
+) (bool, error) {
+	// #nosec G201 -- table and partition names are sanitized.
+	query := fmt.Sprintf(
+		"SELECT EXISTS(SELECT 1 FROM %s PARTITION (%s) WHERE status NOT IN (?, ?) LIMIT 1)",
+		table,
+		strings.Join(quotedNames, ", "),
+	)
+	var blocked bool
+	if err := conn.QueryRowContext(
+		ctx,
+		query,
+		outbox.StatusProcessed,
+		outbox.StatusDead,
+	).Scan(&blocked); err != nil {
+		return false, fmt.Errorf("outbox mysql: inspect partition records failed: %w", err)
+	}
+
+	return blocked, nil
+}
+
+func quotePartitionNames(names []string) ([]string, error) {
+	quotedNames := make([]string, 0, len(names))
+	for _, name := range names {
+		quotedName, err := quotePartitionName(name)
+		if err != nil {
+			return nil, err
+		}
+		quotedNames = append(quotedNames, quotedName)
+	}
+
+	return quotedNames, nil
+}
+
+func validPartitionLayout(engine, method, expression string, subpartitioned bool) bool {
+	expression = strings.TrimSpace(expression)
+	if len(expression) >= 2 && expression[0] == '`' && expression[len(expression)-1] == '`' {
+		expression = expression[1 : len(expression)-1]
+	}
+
+	return strings.EqualFold(engine, partitionEngine) &&
+		strings.EqualFold(method, partitionMethod) &&
+		strings.EqualFold(expression, partitionExpression) &&
+		!subpartitioned
+}
+
+func validPartitionMetadata(
+	engine, name, method, expression, subpartitionMethod sql.NullString,
+) bool {
+	return engine.Valid && name.Valid && name.String != "" && method.Valid && expression.Valid &&
+		validPartitionLayout(engine.String, method.String, expression.String, subpartitionMethod.Valid)
 }
 
 func parsePartitionDescription(desc string) (isMax bool, upper int64, err error) {

@@ -38,7 +38,7 @@ func (g *fixedGenerator) New() (outbox.ID, error) {
 }
 
 func TestStoreEnqueueGeneratesID(t *testing.T) {
-	gen := &fixedGenerator{id: outbox.ID{0x01}}
+	gen := &fixedGenerator{id: validTestID(t, 1)}
 	store := &Store{
 		cfg:     Config{Generator: gen}.withDefaults(),
 		queries: newQueries("outbox"),
@@ -71,7 +71,7 @@ func TestStoreEnqueueGeneratesID(t *testing.T) {
 }
 
 func TestStoreEnqueueSkipsPayloadValidation(t *testing.T) {
-	gen := &fixedGenerator{id: outbox.ID{0x02}}
+	gen := &fixedGenerator{id: validTestID(t, 2)}
 	store := &Store{
 		cfg: Config{
 			Generator:          gen,
@@ -95,6 +95,88 @@ func TestStoreEnqueueSkipsPayloadValidation(t *testing.T) {
 	}
 }
 
+func TestStoreEnqueueRejectsInvalidCallerIDsBeforePersistence(t *testing.T) {
+	valid := validTestID(t, 1)
+	wrongVersion := valid
+	wrongVersion[6] = (wrongVersion[6] & 0x0f) | 0x40
+	wrongVariant := valid
+	wrongVariant[8] &= 0x3f
+
+	tests := []struct {
+		name string
+		id   outbox.ID
+	}{
+		{name: "arbitrary bytes", id: outbox.ID{0x01}},
+		{name: "wrong version", id: wrongVersion},
+		{name: "wrong variant", id: wrongVariant},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			gen := &fixedGenerator{id: valid}
+			store := &Store{
+				cfg:     Config{Generator: gen}.withDefaults(),
+				queries: newQueries("outbox"),
+				table:   "outbox",
+			}
+			fakeExec := &fakeExecutor{}
+			entry := validTestEntry()
+			entry.ID = test.id
+
+			_, err := store.Enqueue(context.Background(), fakeExec, entry)
+			if !errors.Is(err, outbox.ErrInvalidID) {
+				t.Fatalf("error = %v, want ErrInvalidID", err)
+			}
+			if fakeExec.query != "" || len(fakeExec.args) != 0 {
+				t.Fatal("invalid caller ID reached ExecContext")
+			}
+			if gen.calls != 0 {
+				t.Fatalf("generator calls = %d, want 0", gen.calls)
+			}
+		})
+	}
+}
+
+func TestStoreEnqueueRejectsInvalidGeneratedIDsBeforePersistence(t *testing.T) {
+	valid := validTestID(t, 1)
+	wrongVersion := valid
+	wrongVersion[6] = (wrongVersion[6] & 0x0f) | 0x40
+	wrongVariant := valid
+	wrongVariant[8] &= 0x3f
+
+	tests := []struct {
+		name string
+		id   outbox.ID
+	}{
+		{name: "zero", id: outbox.ID{}},
+		{name: "wrong version", id: wrongVersion},
+		{name: "wrong variant", id: wrongVariant},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			gen := &fixedGenerator{id: test.id}
+			store := &Store{
+				cfg:     Config{Generator: gen}.withDefaults(),
+				queries: newQueries("outbox"),
+				table:   "outbox",
+			}
+			fakeExec := &fakeExecutor{}
+
+			_, err := store.Enqueue(context.Background(), fakeExec, validTestEntry())
+			if !errors.Is(err, outbox.ErrInvalidID) {
+				t.Fatalf("error = %v, want ErrInvalidID", err)
+			}
+			if fakeExec.query != "" || len(fakeExec.args) != 0 {
+				t.Fatal("invalid generated ID reached ExecContext")
+			}
+			if gen.calls != 1 {
+				t.Fatalf("generator calls = %d, want 1", gen.calls)
+			}
+		})
+	}
+}
+
 func TestMakePlaceholders(t *testing.T) {
 	if got := makePlaceholders(1); got != "?" {
 		t.Fatalf("unexpected placeholders: %s", got)
@@ -109,5 +191,25 @@ func TestTruncateError(t *testing.T) {
 	msg := truncateError(errors.New(long))
 	if len([]rune(msg)) != maxErrorLen {
 		t.Fatalf("expected truncated length %d, got %d", maxErrorLen, len([]rune(msg)))
+	}
+}
+
+func validTestID(t *testing.T, suffix byte) outbox.ID {
+	t.Helper()
+	id, err := outbox.ParseID("017f22e2-79b0-7cc3-98c4-dc0c0c07398f")
+	if err != nil {
+		t.Fatalf("parse test UUIDv7: %v", err)
+	}
+	id[15] = suffix
+
+	return id
+}
+
+func validTestEntry() outbox.Entry {
+	return outbox.Entry{
+		AggregateType: "order",
+		AggregateID:   "1",
+		EventType:     "created",
+		Payload:       json.RawMessage(`{"id":1}`),
 	}
 }

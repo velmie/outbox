@@ -9,6 +9,10 @@ interpret the output files so you can draw correct conclusions and then dig deep
 The focus is not on benchmarking theory in the abstract. It is on the concrete mechanics of this harness and the
 database behaviors it stresses.
 
+> **Warning:** Every case launched by `scripts/benchmarks-run.sh` uses `-reset=true` and drops and recreates its table.
+> The default table is `outbox_bench`. When using an external MySQL instance, use a disposable, isolated database or
+> table and credentials scoped to it. Never point the harness at a production or shared outbox table.
+
 ---
 
 ## 1. What is being benchmarked
@@ -62,13 +66,13 @@ Mechanics:
 
     * `workers` (concurrency)
     * `batchSize` (how many rows per fetch/ack cycle)
-    * `partitionWindow` (optional partition pruning hint)
+
 3. The relay runs until a target processed count is reached, then the benchmark cancels the context.
 
 What you learn:
 
 * How worker count and batch size translate into throughput on your hardware and MySQL config
-* Whether partition pruning helps or hurts in your data distribution
+* Whether a partitioned or non-partitioned storage layout changes throughput for your data distribution
 * How payload size affects read path cost
 
 ### Enqueue mode
@@ -126,34 +130,30 @@ The harness can create the outbox table in two ways:
 
 Why this matters:
 
-* With a long-lived outbox table, older rows accumulate.
-* If your relay queries include a predicate that aligns with the partition key (for example, "only look at the last
-  hour/day"), MySQL can use **partition pruning** to avoid scanning partitions that cannot match.
+* A long-lived outbox table needs a bounded retention strategy.
+* Time partitions allow old terminal data to be rotated by dropping complete partitions.
+* The current relay query still considers the complete pending backlog, so benchmark differences reflect the storage
+  layout and data distribution, not a recent-time cutoff.
 
 In this harness, partitions are created during table reset using:
 
 * `partitionPeriod`: `day` or `month`
-* `partitionAhead`: create future partitions so inserts do not fail or cause DDL at runtime
+* `partitionAhead`: create dated partitions ahead of the current period
 * `partitionLookback`: create past partitions (useful for seeding historical distributions)
 
-### Partition pruning and the "partition window"
+### Full-backlog polling and the deprecated partition window
 
-The relay can be configured with a `partitionWindow`:
+The current relay fetches pending rows without a time predicate. The `-partition-window` flag and runner
+`PARTITION_WINDOW` variable are deprecated compatibility inputs: they are accepted and recorded in results, metadata,
+and checkpoint keys, but they do not change polling, target selection, or the measured workload. Auto-target also
+counts the complete pending backlog.
 
-* `partitionWindow > 0`: relay attempts to restrict work to a recent time window
-* `partitionWindow = 0`: no time restriction hint
+The partition-effect phase therefore answers this question:
 
-Guardrail: when using time-distributed seeding (`seed-age`/`seed-days`) with a non-zero `partitionWindow`, the newest
-seeded records must still be inside that window. Otherwise the relay will see no rows and the run fails fast. A safe
-rule of thumb is `partitionWindow >= max(0, seedAge - (seedDays-1)*24h)`.
+> With the same time-distributed backlog, how does a partitioned table compare with a non-partitioned table?
 
-The point of the partition-effect phase is to answer a practical question:
-
-> If my outbox contains history, does narrowing the consumer's scan window reduce work enough to matter?
-
-This can be dramatic if your workload mixes "recent traffic" with "old backlog" and the schema is partitioned in a
-compatible way. It can also be neutral or even negative if your constraints are not selective, or if partition switching
-causes more complexity than it saves.
+Do not attribute a difference from this phase to time-window filtering or partition pruning. The current polling query
+does not provide that experimental condition.
 
 ---
 
@@ -188,7 +188,8 @@ The time-distribution mechanism (used only for seeding, not for live enqueue):
 
 * For partition-effect runs, seeding uses an explicit ID generator (`UUIDv7` generator with a custom clock).
 * The clock **advances 1 ms per record without real waiting** (the clock is simulated), and it starts at controlled base times spread across days.
-* The goal is to produce records whose time component spans many partitions, so pruning behavior is observable.
+* The goal is to produce records whose time component spans many partitions, so partitioned and non-partitioned layouts
+  can be compared under the same historical distribution.
 
 ### Mixed-mode timestamps
 
@@ -208,7 +209,7 @@ The benchmark is not just a single run. The scripts implement a small experiment
 
 ### Isolation: reset per run
 
-Each run typically:
+Each runner case:
 
 * Drops and recreates the outbox table (`reset=true`).
 * Optionally recreates partitions.
@@ -280,6 +281,9 @@ This is useful when:
 
 The harness can start MySQL automatically in Docker, with two important profiles:
 
+Set the profile through `MYSQL_PROFILE` when using `scripts/benchmarks-run.sh`. If you invoke
+`scripts/mysql-bench.sh` directly, its variable is named `PROFILE`.
+
 ### Fast profile (default)
 
 Designed for quick iteration:
@@ -321,16 +325,21 @@ Practical takeaway:
 Long benchmark runs can fill disks primarily via MySQL binary logs and temporary files. The harness includes safeguards
 to limit growth:
 
-* `scripts/mysql-bench.sh` defaults to disabling binlog for `MYSQL_PROFILE=fast` and enables binlog with short retention
-  for `MYSQL_PROFILE=prod`.
-* `scripts/benchmarks-run.sh` can auto-purge binlogs between phases when running the bundled MySQL container.
+* `scripts/mysql-bench.sh` disables binlog by default for `PROFILE=fast`. If enabled, expiration defaults to 600 seconds
+  and maximum file size to 256M.
+* `scripts/mysql-bench.sh` enables binlog by default for `PROFILE=prod`, with expiration at 3600 seconds and maximum
+  file size at 1G.
+* With bundled MySQL, `scripts/benchmarks-run.sh` makes a best-effort purge after every completed run and again at phase
+  transitions.
 
 Controls:
 
 * `BINLOG=0|1` (mysql-bench.sh): force binlog off/on (default: off for fast, on for prod).
-* `BINLOG_EXPIRE_SECONDS=600` (mysql-bench.sh): how long to keep binlogs when enabled.
-* `BINLOG_MAX_SIZE=256M` (mysql-bench.sh): binlog rotation size.
-* `PURGE_BINLOG=1` (benchmarks-run.sh): run `RESET MASTER` between phases (default: on when `START_MYSQL=1`).
+* `BINLOG_EXPIRE_SECONDS` (mysql-bench.sh): how long to keep binlogs when enabled; defaults to 600 for `fast` and 3600
+  for `prod`.
+* `BINLOG_MAX_SIZE` (mysql-bench.sh): binlog rotation size; defaults to 256M for `fast` and 1G for `prod`.
+* `PURGE_BINLOG=1` (benchmarks-run.sh): run `RESET MASTER` after runs and at phase transitions; defaults to on when
+  `START_MYSQL=1`.
 
 If you run against an external MySQL (`START_MYSQL=0`), binlog purge is disabled by default to avoid permission issues.
 
@@ -470,13 +479,13 @@ Key flags and their typical effects:
 
     * controls partition creation range at reset time
 
-* `-partition-window=1h` (or `0`)
+* `-partition-window`
 
-    * gives the relay a window hint that can enable pruning and reduce scans
+    * deprecated compatibility input; accepted and recorded, but ignored
 
 * `-seed-age`, `-seed-days` (consume)
 
-    * controls time distribution during seeding, used to stress partition pruning
+    * controls historical UUIDv7 time distribution during seeding for partition-layout comparisons
 
 * `-producer-interval` (mixed)
 
@@ -503,10 +512,10 @@ Key flags and their typical effects:
 
 * `-auto-target`
 
-  * when enabled (default), the consume mode automatically lowers the processing target to the number of visible
-    pending rows under the current `partitionWindow`
-  * prevents indefinite runs when only part of the seeded data falls inside the window
-  * if disabled and the requested `records` exceed visible rows, the run fails fast
+  * when enabled (default), consume mode counts the complete pending backlog and lowers the target if that count is less
+    than the requested `records`
+  * it does not apply a time-window filter
+  * when disabled, the requested target is left unchanged
 
 ### Parameters and metrics overview (quick reference)
 
@@ -514,7 +523,7 @@ Key flags and their typical effects:
 | --- | --- | --- | --- | --- |
 | Consume | `-workers` | Parallel relay workers | Throughput (msg/s) | Improves throughput until DB CPU or connection pool saturates |
 | Consume | `-batch-size` | Rows fetched and acked per transaction | Throughput and batch latency | Reduces per-message overhead, but can increase tail latency |
-| Consume | `-partition-window` | Time window hint for partition pruning | Read efficiency and throughput | Can reduce scanned partitions on large tables |
+| Consume | `-partition-window` | Deprecated compatibility input | None | Accepted and recorded, but ignored |
 | Enqueue | `-use-tx` | Wrap each enqueue in a transaction | Insert throughput | Adds commit/fsync overhead; typically lowers insert rate |
 | Mixed | `-producers` | Concurrent producer goroutines | Throughput and max lag | More concurrency increases pressure on DB and pool |
 | Mixed | `-payload-bytes` | Payload size in bytes | IO/CPU cost and latency | Larger payloads reduce msg/s and raise latency |
@@ -537,7 +546,7 @@ Important environment variables in `scripts/benchmarks-run.sh`:
 
     * changes durability and storage backing
 
-* `START_MYSQL=1|0`, `DSN=...`
+* `START_MYSQL=1|0`, `OUTBOX_DSN`
 
     * choose bundled docker MySQL or external MySQL
 
@@ -557,6 +566,10 @@ A run writes to:
 
 `docs/benchmarks/results/<RUN_ID>/`
 
+Tracked result directories are immutable, revision-specific evidence. Older datasets may contain nonzero
+`partition_window` values produced when that input had different semantics. Keep those artifacts unchanged and do not
+combine them with current results without identifying the producing revision.
+
 ### `metadata.txt`
 
 Contains:
@@ -575,7 +588,8 @@ One JSON object per run (one line each). Includes:
 * all benchmark metrics from the Go program
 * plus harness fields: `phase`, `warmup`, `repeat`, `checkpoint_key`
 * plus sampled max CPU/RSS metrics for the benchmark and MySQL processes
-* consume runs also include `visible_records` and `target_records` when `auto-target` is enabled
+* current consume runs include `visible_records` and `target_records`; with `auto-target`, these describe the complete
+  pending backlog and the resulting processing target
 
 This is the source of truth for any custom analysis.
 
@@ -640,21 +654,14 @@ If you care about durable enqueue rate, run:
 * enqueue phase with `use_tx=true`
 * and consider the throughput as the upper bound for "events per second per MySQL primary" under strict durability
 
-### Partition pruning is workload-dependent
+### Interpret the partition-layout comparison narrowly
 
-Partitioning helps if:
+The current relay scans the complete pending backlog and does not apply a created-time predicate. The partition-effect
+phase compares partitioned and non-partitioned table layouts under the same time-distributed data. It can show a layout
+difference on the tested MySQL configuration, but it does not measure time-window filtering or partition pruning.
 
-* your read queries can exclude old partitions
-* your data distribution spans many partitions
-* and your relay actually limits scans via `partitionWindow` or similar predicates
-
-Partitioning can be neutral or harmful if:
-
-* your workload is only recent anyway
-* partitioning adds complexity without reducing scanned pages
-* your partition key is not aligned with access patterns
-
-That is why the harness includes explicit partition-effect experiments with time-distributed seeding.
+Treat partitioning primarily as a retention and rotation choice unless a separate experiment verifies another access
+pattern.
 
 ---
 
@@ -676,10 +683,10 @@ PLAN=full ./scripts/benchmarks-run.sh
 
 External MySQL:
 
+Supply `OUTBOX_DSN` through the process environment or a secret manager before running the command.
+
 ```bash
-START_MYSQL=0 \
-DSN='user:pass@tcp(127.0.0.1:3306)/outbox?parseTime=true' \
-./scripts/benchmarks-run.sh
+START_MYSQL=0 ./scripts/benchmarks-run.sh
 ```
 
 More production-like durability:

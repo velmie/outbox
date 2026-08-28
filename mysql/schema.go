@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"fmt"
+	"strconv"
 )
 
 const schemaTemplate = `CREATE TABLE IF NOT EXISTS %s (
@@ -20,7 +21,7 @@ const schemaTemplate = `CREATE TABLE IF NOT EXISTS %s (
 	created_ts BIGINT GENERATED ALWAYS AS (CONV(SUBSTR(HEX(id), 1, 12), 16, 10) DIV 1000) STORED,
 	PRIMARY KEY (id, created_ts),
 	INDEX idx_status_id (status, id)
-)%s;`
+) ENGINE=InnoDB%s;`
 
 const (
 	payloadJSON           = "JSON"
@@ -31,6 +32,8 @@ const (
 )
 
 // Partition defines a range partition for created_ts.
+// Name must match [A-Za-z_][A-Za-z0-9_]{0,63}.
+// LessThan must be a base-10 integer or the exact string MAXVALUE.
 type Partition struct {
 	Name     string
 	LessThan string
@@ -48,42 +51,20 @@ func SchemaBinary(table string) (string, error) {
 
 // PartitionedSchema returns a schema with RANGE partitions on created_ts.
 func PartitionedSchema(table string, partitions []Partition) (string, error) {
-	if len(partitions) == 0 {
-		return "", ErrPartitionsRequired
+	clause, err := buildPartitionClause(partitions)
+	if err != nil {
+		return "", err
 	}
-
-	clause := partitionClausePrefix
-	for i, part := range partitions {
-		if part.Name == "" || part.LessThan == "" {
-			return "", ErrInvalidPartition
-		}
-		if i > 0 {
-			clause += ","
-		}
-		clause += fmt.Sprintf("\n\tPARTITION %s VALUES LESS THAN (%s)", part.Name, part.LessThan)
-	}
-	clause += partitionClauseSuffix
 
 	return buildSchema(table, payloadJSON, clause)
 }
 
 // PartitionedSchemaBinary returns a schema with LONGBLOB payload and RANGE partitions on created_ts.
 func PartitionedSchemaBinary(table string, partitions []Partition) (string, error) {
-	if len(partitions) == 0 {
-		return "", ErrPartitionsRequired
+	clause, err := buildPartitionClause(partitions)
+	if err != nil {
+		return "", err
 	}
-
-	clause := partitionClausePrefix
-	for i, part := range partitions {
-		if part.Name == "" || part.LessThan == "" {
-			return "", ErrInvalidPartition
-		}
-		if i > 0 {
-			clause += ","
-		}
-		clause += fmt.Sprintf("\n\tPARTITION %s VALUES LESS THAN (%s)", part.Name, part.LessThan)
-	}
-	clause += partitionClauseSuffix
 
 	return buildSchema(table, payloadBinary, clause)
 }
@@ -95,4 +76,42 @@ func buildSchema(table, payloadType, partitionClause string) (string, error) {
 	}
 
 	return fmt.Sprintf(schemaTemplate, name, payloadType, headersJSON, partitionClause), nil
+}
+
+func buildPartitionClause(partitions []Partition) (string, error) {
+	if len(partitions) == 0 {
+		return "", ErrPartitionsRequired
+	}
+
+	clause := partitionClausePrefix
+	for i, part := range partitions {
+		name, err := quotePartitionName(part.Name)
+		if err != nil {
+			return "", err
+		}
+		bound, err := normalizePartitionBound(part.LessThan)
+		if err != nil {
+			return "", err
+		}
+		if i > 0 {
+			clause += ","
+		}
+		clause += fmt.Sprintf("\n\tPARTITION %s VALUES LESS THAN (%s)", name, bound)
+	}
+	clause += partitionClauseSuffix
+
+	return clause, nil
+}
+
+func normalizePartitionBound(value string) (string, error) {
+	if value == "MAXVALUE" {
+		return value, nil
+	}
+
+	bound, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return "", ErrInvalidPartition
+	}
+
+	return strconv.FormatInt(bound, 10), nil
 }

@@ -8,7 +8,10 @@ import (
 	"time"
 )
 
-// FailureHandler is called when a record processing returns an error.
+// FailureHandler is called when record processing returns an error.
+// It receives the original handler error. Implementations that log or persist
+// the record or error are responsible for handling sensitive data safely.
+// A handler panic is represented by a generic error without the panic value.
 type FailureHandler func(ctx context.Context, record Record, err error)
 
 // Relay polls a Consumer and invokes a Handler for each record.
@@ -19,12 +22,6 @@ type Relay struct {
 
 	pendingMu sync.Mutex
 	pendingAt time.Time
-}
-
-type batchOutcome struct {
-	successful []ID
-	failed     []Failure
-	dead       []Failure
 }
 
 // NewRelay constructs a Relay with defaults and optional settings.
@@ -63,11 +60,10 @@ func (r *Relay) Run(ctx context.Context) error {
 		go func() {
 			defer wg.Done()
 			defer func() {
-				if rec := recover(); rec != nil {
-					err := fmt.Errorf("%w: %v", ErrWorkerPanic, rec)
-					r.cfg.Logger.Error("outbox worker panic", "worker", workerID, "panic", rec)
-					errCh <- err
+				if recover() != nil {
+					errCh <- ErrWorkerPanic
 					cancel()
+					r.reportWorkerPanic(workerID)
 				}
 			}()
 
@@ -112,6 +108,12 @@ func (r *Relay) ProcessOnce(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
+type batchOutcome struct {
+	successful []ID
+	failed     []Failure
+	dead       []Failure
+}
+
 func (r *Relay) runWorker(ctx context.Context) error {
 	for {
 		select {
@@ -141,15 +143,10 @@ func (r *Relay) runWorker(ctx context.Context) error {
 }
 
 func (r *Relay) fetchBatch(ctx context.Context) (Batch, error) {
-	opts := FetchOptions{BatchSize: r.cfg.BatchSize}
-	if r.cfg.PartitionWindow > 0 {
-		opts.MinCreatedAt = r.cfg.Clock.Now().Add(-r.cfg.PartitionWindow)
-	}
-
-	return r.consumer.Fetch(ctx, opts)
+	return r.consumer.Fetch(ctx, FetchOptions{BatchSize: r.cfg.BatchSize})
 }
 
-func (r *Relay) processBatch(ctx context.Context, batch Batch) error {
+func (r *Relay) processBatch(ctx context.Context, batch Batch) (err error) {
 	start := time.Now()
 	defer func() {
 		r.cfg.Metrics.ObserveBatchDuration(time.Since(start))
@@ -158,20 +155,40 @@ func (r *Relay) processBatch(ctx context.Context, batch Batch) error {
 	if batch == nil {
 		return ErrNilBatch
 	}
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		if rollbackErr := batch.Rollback(); rollbackErr != nil {
+			err = errors.Join(err, fmt.Errorf("outbox rollback failed: %w", rollbackErr))
+		}
+	}()
 
 	records := batch.Records()
 	if len(records) == 0 {
-		rollbackErr := batch.Rollback()
-
-		return errors.Join(ErrEmptyBatch, rollbackErr)
+		return ErrEmptyBatch
 	}
 
 	outcome, err := r.collectBatchResults(ctx, records)
 	if err != nil {
-		return r.rollbackWith(batch, err)
+		return err
 	}
 
-	return r.applyBatchResults(ctx, batch, outcome)
+	if err := r.applyBatchResults(ctx, batch, outcome); err != nil {
+		return err
+	}
+	if err := batch.Commit(); err != nil {
+		return fmt.Errorf("outbox commit failed: %w", err)
+	}
+	committed = true
+
+	r.cfg.Metrics.AddProcessed(len(outcome.successful))
+	r.cfg.Metrics.AddErrors(len(outcome.failed) + len(outcome.dead))
+	r.cfg.Metrics.AddRetries(len(outcome.failed))
+	r.cfg.Metrics.AddDead(len(outcome.dead))
+
+	return nil
 }
 
 func (r *Relay) collectBatchResults(ctx context.Context, records []Record) (batchOutcome, error) {
@@ -187,14 +204,22 @@ func (r *Relay) collectBatchResults(ctx context.Context, records []Record) (batc
 		if r.cfg.HandlerTimeout > 0 {
 			handleCtx, cancel = context.WithTimeout(ctx, r.cfg.HandlerTimeout)
 		}
-		err := r.handler.Handle(handleCtx, record)
+		panicked, handlerErr := r.invokeHandler(handleCtx, record)
+		timedOut := r.cfg.HandlerTimeout > 0 && errors.Is(handleCtx.Err(), context.DeadlineExceeded)
 		cancel()
 
-		if err != nil {
+		if handlerErr != nil {
 			if ctx.Err() != nil {
 				return outcome, ctx.Err()
 			}
-			r.recordFailure(ctx, record, err, &outcome)
+
+			persistedErr := errHandlerFailed
+			if panicked {
+				persistedErr = errHandlerPanicked
+			} else if timedOut {
+				persistedErr = errHandlerTimedOut
+			}
+			r.recordFailure(ctx, record, handlerErr, persistedErr, &outcome)
 
 			continue
 		}
@@ -204,29 +229,46 @@ func (r *Relay) collectBatchResults(ctx context.Context, records []Record) (batc
 	return outcome, nil
 }
 
-func (r *Relay) recordFailure(ctx context.Context, record Record, err error, outcome *batchOutcome) {
+func (r *Relay) invokeHandler(ctx context.Context, record Record) (panicked bool, err error) {
+	defer func() {
+		if recover() != nil {
+			err = errHandlerPanicked
+			panicked = true
+		}
+	}()
+
+	return false, r.handler.Handle(ctx, record)
+}
+
+func (r *Relay) recordFailure(
+	ctx context.Context,
+	record Record,
+	handlerErr error,
+	persistedErr error,
+	outcome *batchOutcome,
+) {
 	if r.cfg.ErrorHandler != nil {
-		r.cfg.ErrorHandler(ctx, record, err)
+		r.cfg.ErrorHandler(ctx, record, handlerErr)
 	}
 
-	action := r.cfg.FailureClassifier(ctx, record, err)
+	action := r.cfg.FailureClassifier(ctx, record, handlerErr)
 	if action == FailureDead {
-		outcome.dead = append(outcome.dead, Failure{ID: record.ID, Err: err})
+		outcome.dead = append(outcome.dead, Failure{ID: record.ID, Err: persistedErr})
 
 		return
 	}
-	outcome.failed = append(outcome.failed, Failure{ID: record.ID, Err: err})
+	outcome.failed = append(outcome.failed, Failure{ID: record.ID, Err: persistedErr})
 }
 
 func (r *Relay) applyBatchResults(ctx context.Context, batch Batch, outcome batchOutcome) error {
 	if len(outcome.successful) > 0 {
 		if err := batch.Ack(ctx, outcome.successful); err != nil {
-			return r.rollbackWith(batch, fmt.Errorf("outbox ack failed: %w", err))
+			return fmt.Errorf("outbox ack failed: %w", err)
 		}
 	}
 	if len(outcome.failed) > 0 {
 		if err := batch.Fail(ctx, outcome.failed); err != nil {
-			return r.rollbackWith(batch, fmt.Errorf("outbox fail update failed: %w", err))
+			return fmt.Errorf("outbox fail update failed: %w", err)
 		}
 	}
 	if len(outcome.dead) > 0 {
@@ -235,15 +277,6 @@ func (r *Relay) applyBatchResults(ctx context.Context, batch Batch, outcome batc
 		}
 	}
 
-	if err := batch.Commit(); err != nil {
-		return r.rollbackWith(batch, fmt.Errorf("outbox commit failed: %w", err))
-	}
-
-	r.cfg.Metrics.AddProcessed(len(outcome.successful))
-	r.cfg.Metrics.AddErrors(len(outcome.failed) + len(outcome.dead))
-	r.cfg.Metrics.AddRetries(len(outcome.failed))
-	r.cfg.Metrics.AddDead(len(outcome.dead))
-
 	return nil
 }
 
@@ -251,7 +284,7 @@ func (r *Relay) handleDead(ctx context.Context, batch Batch, dead []Failure) err
 	deadBatch, ok := batch.(DeadBatch)
 	if ok {
 		if err := deadBatch.Dead(ctx, dead); err != nil {
-			return r.rollbackWith(batch, fmt.Errorf("outbox dead-letter update failed: %w", err))
+			return fmt.Errorf("outbox dead-letter update failed: %w", err)
 		}
 
 		return nil
@@ -259,19 +292,18 @@ func (r *Relay) handleDead(ctx context.Context, batch Batch, dead []Failure) err
 
 	r.cfg.Logger.Warn("outbox batch does not support dead-lettering; falling back to retry", "count", len(dead))
 	if err := batch.Fail(ctx, dead); err != nil {
-		return r.rollbackWith(batch, fmt.Errorf("outbox dead-letter fallback failed: %w", err))
+		return fmt.Errorf("outbox dead-letter fallback failed: %w", err)
 	}
 
 	return nil
 }
 
-func (r *Relay) rollbackWith(batch Batch, err error) error {
-	rollbackErr := batch.Rollback()
-	if rollbackErr == nil {
-		return err
-	}
+func (r *Relay) reportWorkerPanic(workerID int) {
+	defer func() {
+		_ = recover()
+	}()
 
-	return errors.Join(err, fmt.Errorf("outbox rollback failed: %w", rollbackErr))
+	r.cfg.Logger.Error("outbox worker panic", "worker", workerID)
 }
 
 func (r *Relay) sleep(ctx context.Context, d time.Duration) error {

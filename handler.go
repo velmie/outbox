@@ -5,6 +5,8 @@ import "context"
 // Handler processes a single outbox record.
 type Handler interface {
 	// Handle processes a single record and returns an error on failure.
+	// Relay calls Handle synchronously and waits for it to return, so Handle must
+	// observe context cancellation and deadlines when bounded execution is required.
 	Handle(ctx context.Context, record Record) error
 }
 

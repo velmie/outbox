@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,13 +30,16 @@ func TestPartitionsCLIContainer(t *testing.T) {
 
 	bin := testutil.BuildBinary(t, ".")
 	args := []string{
-		"-dsn", env.DSN,
 		"-table", "outbox",
 		"-period", "day",
 		"-lookahead", "48h",
 		"-once",
 	}
-	code, logs := testutil.RunCLIContainer(t, ctx, env.Network.Name, bin, args)
+	containerEnv := map[string]string{"OUTBOX_DSN": env.DSN}
+	code, logs := testutil.RunCLIContainer(t, ctx, env.Network.Name, bin, containerEnv, args)
+	if strings.Contains(logs, env.Password) {
+		t.Fatal("partitions logs contain the database password")
+	}
 	if code != 0 {
 		t.Fatalf("partitions exit code %d logs: %s", code, logs)
 	}

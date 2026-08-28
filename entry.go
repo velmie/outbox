@@ -4,7 +4,8 @@ import "encoding/json"
 
 // Entry describes a new outbox message to be persisted.
 type Entry struct {
-	// ID is optional, if zero, the store generator assigns a UUID v7.
+	// ID is optional. If zero, the store generator assigns a UUIDv7.
+	// A nonzero ID must be an RFC 9562 UUIDv7; its timestamp may be historical.
 	ID ID
 	// AggregateType is a coarse-grained stream identifier (e.g., "order").
 	AggregateType string
@@ -48,6 +49,9 @@ func (e Entry) validate(validatePayload, validateHeaders bool) error {
 	}
 	if validateHeaders && len(e.Headers) > 0 && !json.Valid(e.Headers) {
 		return ErrInvalidHeaders
+	}
+	if !e.ID.IsZero() && !e.ID.isUUIDv7() {
+		return ErrInvalidID
 	}
 
 	return nil

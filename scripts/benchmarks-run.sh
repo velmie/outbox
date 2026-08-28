@@ -10,11 +10,12 @@ JSONL="${OUT_DIR}/results.jsonl"
 CSV="${OUT_DIR}/results.csv"
 SUMMARY="${OUT_DIR}/summary.csv"
 
-DSN="${DSN:-root:secret@tcp(127.0.0.1:3307)/outbox?parseTime=true}"
+START_MYSQL="${START_MYSQL:-1}"
+OUTBOX_DSN="${OUTBOX_DSN:-${DSN:-}}"
 MYSQL_HOST="${MYSQL_HOST:-127.0.0.1}"
 MYSQL_PORT="${MYSQL_PORT:-3307}"
 MYSQL_USER="${MYSQL_USER:-root}"
-MYSQL_PASSWORD="${MYSQL_PASSWORD:-secret}"
+MYSQL_PASSWORD="${MYSQL_PASSWORD:-}"
 MYSQL_DB="${MYSQL_DB:-outbox}"
 MYSQL_CONTAINER_NAME="${MYSQL_CONTAINER_NAME:-outbox-mysql-bench}"
 MYSQL_PROFILE="${MYSQL_PROFILE:-fast}"
@@ -24,7 +25,6 @@ PURGE_BINLOG="${PURGE_BINLOG:-}"
 
 BENCH_BIN="${BENCH_BIN:-/tmp/outbox-bench}"
 BUILD_BENCH="${BUILD_BENCH:-1}"
-START_MYSQL="${START_MYSQL:-1}"
 
 PLAN="${PLAN:-full}"
 REPEATS="${REPEATS:-5}"
@@ -47,7 +47,8 @@ MIXED="${MIXED:-1}"
 
 PARTITION_AHEAD="${PARTITION_AHEAD:-168h}"
 PARTITION_LOOKBACK="${PARTITION_LOOKBACK:-0s}"
-PARTITION_WINDOW="${PARTITION_WINDOW:-1h}"
+# Deprecated compatibility input. outbox-bench accepts but ignores the value.
+PARTITION_WINDOW="${PARTITION_WINDOW:-0s}"
 
 PARTITION_EFFECT_RECORDS="${PARTITION_EFFECT_RECORDS:-2000000}"
 PARTITION_EFFECT_DAYS="${PARTITION_EFFECT_DAYS:-90}"
@@ -60,6 +61,18 @@ BATCH_LIST=(10 50 100 200)
 PAYLOAD_LIST=(128 512 4096)
 LARGE_PAYLOAD_LIST=(16384 131072)
 PRODUCERS_LIST=(1 2 4 8)
+
+if [[ "${START_MYSQL}" == "1" ]]; then
+  if [[ -z "${MYSQL_PASSWORD}" ]]; then
+    MYSQL_PASSWORD="$(od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]')"
+  fi
+  if [[ -z "${OUTBOX_DSN}" ]]; then
+    OUTBOX_DSN="${MYSQL_USER}:${MYSQL_PASSWORD}@tcp(${MYSQL_HOST}:${MYSQL_PORT})/${MYSQL_DB}?parseTime=true"
+  fi
+elif [[ -z "${OUTBOX_DSN}" ]]; then
+  echo "OUTBOX_DSN is required when START_MYSQL=0 (legacy DSN is also accepted)." >&2
+  exit 1
+fi
 
 if [[ "${PLAN}" == "mini" ]]; then
   WORKERS_LIST=(1 2)
@@ -103,9 +116,9 @@ purge_binlog() {
   if [[ "${START_MYSQL}" != "1" ]]; then
     return
   fi
-  docker exec "${MYSQL_CONTAINER_NAME}" \
-    mysql -h 127.0.0.1 -P "${MYSQL_PORT}" -uroot -p"${MYSQL_PASSWORD}" \
-    -e "RESET MASTER;" >/dev/null 2>&1 || true
+  docker exec -e OUTBOX_MYSQL_PORT="${MYSQL_PORT}" "${MYSQL_CONTAINER_NAME}" \
+    sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysql -h 127.0.0.1 -P "$OUTBOX_MYSQL_PORT" -uroot -e "RESET MASTER;"' \
+    >/dev/null 2>&1 || true
 }
 
 if [[ "${START_MYSQL}" == "1" ]]; then
@@ -126,8 +139,9 @@ if [[ "${START_MYSQL}" == "1" ]]; then
   echo "Waiting for MySQL to accept connections..."
   ready=0
   for _ in $(seq 1 "${MYSQL_WAIT_SECONDS}"); do
-    if docker exec "${MYSQL_CONTAINER_NAME}" \
-      mysqladmin ping -h 127.0.0.1 -P "${MYSQL_PORT}" -uroot -p"${MYSQL_PASSWORD}" --silent >/dev/null 2>&1; then
+    if docker exec -e OUTBOX_MYSQL_PORT="${MYSQL_PORT}" "${MYSQL_CONTAINER_NAME}" \
+      sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysqladmin ping -h 127.0.0.1 -P "$OUTBOX_MYSQL_PORT" -uroot --silent' \
+      >/dev/null 2>&1; then
       ready=1
       break
     fi
@@ -159,7 +173,6 @@ else
   {
     echo "run_id=${RUN_ID}"
     echo "plan=${PLAN}"
-    echo "dsn=${DSN}"
     echo "records_consume=${CONSUME_RECORDS}"
     echo "records_enqueue=${ENQUEUE_RECORDS}"
     echo "records_mixed=${MIXED_RECORDS}"
@@ -330,7 +343,6 @@ run_bench() {
 
   local args=(
     -json=true
-    -dsn "${DSN}"
     -mode "${mode}"
     -records "${records}"
     -payload-bytes "${payload}"
@@ -374,7 +386,7 @@ run_bench() {
 
   local run_start
   run_start="$(date +%s%3N)"
-  "${BENCH_BIN}" "${args[@]}" > "${json_file}" &
+  OUTBOX_DSN="${OUTBOX_DSN}" "${BENCH_BIN}" "${args[@]}" > "${json_file}" &
   local bench_pid=$!
 
   while kill -0 "${bench_pid}" >/dev/null 2>&1; do
@@ -553,7 +565,7 @@ run_consume_phase() {
   fi
   local runs_total=$((combos * runs_per_combo))
   add_phase_runs "${phase}" "${runs_total}"
-  announce_phase_segment "${phase}" "partitioned=${partitioned} window=${partition_window}" "${runs_total}"
+  announce_phase_segment "${phase}" "partitioned=${partitioned}" "${runs_total}"
 
   for workers in "${WORKERS_LIST[@]}"; do
     for batch in "${BATCH_LIST[@]}"; do
@@ -800,15 +812,13 @@ if [[ "${MIXED}" == "1" ]]; then
   purge_binlog
 fi
 
-echo "Running phase: partition effect (large, window on/off, partitioned on/off)"
+echo "Running phase: partition effect (large, partitioned on/off)"
 WORKERS_LIST=(4)
 BATCH_LIST=(50)
 PAYLOAD_LIST=(512)
 for partitioned in true false; do
-  for window in "${PARTITION_WINDOW}" "0s"; do
-    run_consume_phase "partition" "${PARTITION_EFFECT_RECORDS}" "${partitioned}" "${window}" "${PARTITION_EFFECT_LOOKBACK}" "${PARTITION_EFFECT_SEED_AGE}" "${PARTITION_EFFECT_DAYS}"
-    purge_binlog
-  done
+  run_consume_phase "partition" "${PARTITION_EFFECT_RECORDS}" "${partitioned}" "${PARTITION_WINDOW}" "${PARTITION_EFFECT_LOOKBACK}" "${PARTITION_EFFECT_SEED_AGE}" "${PARTITION_EFFECT_DAYS}"
+  purge_binlog
 done
 
 echo "Running phase: durability (top combos, durability-specific runs)"

@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -43,13 +44,16 @@ func TestCleanupCLIContainer(t *testing.T) {
 
 	bin := testutil.BuildBinary(t, ".")
 	args := []string{
-		"-dsn", env.DSN,
 		"-table", "outbox",
 		"-retention", "24h",
 		"-include-dead",
 		"-once",
 	}
-	code, logs := testutil.RunCLIContainer(t, ctx, env.Network.Name, bin, args)
+	containerEnv := map[string]string{"OUTBOX_DSN": env.DSN}
+	code, logs := testutil.RunCLIContainer(t, ctx, env.Network.Name, bin, containerEnv, args)
+	if strings.Contains(logs, env.Password) {
+		t.Fatal("cleanup logs contain the database password")
+	}
 	if code != 0 {
 		t.Fatalf("cleanup exit code %d logs: %s", code, logs)
 	}

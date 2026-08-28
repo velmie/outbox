@@ -5,7 +5,6 @@ import "fmt"
 type queries struct {
 	insert           string
 	selectPending    string
-	selectPendingTS  string
 	updateFailureOne string
 	updateDeadOne    string
 	countPending     string
@@ -16,11 +15,6 @@ func newQueries(table string) queries {
 	insert := fmt.Sprintf("INSERT INTO %s (id, aggregate_type, aggregate_id, event_type, payload, headers) VALUES (?, ?, ?, ?, ?, ?)", table)
 	selectBase := fmt.Sprintf(
 		"SELECT %s FROM %s WHERE status = ? ORDER BY id ASC LIMIT ? FOR UPDATE SKIP LOCKED",
-		cols,
-		table,
-	)
-	selectWithTS := fmt.Sprintf(
-		"SELECT %s FROM %s WHERE status = ? AND created_ts >= ? ORDER BY id ASC LIMIT ? FOR UPDATE SKIP LOCKED",
 		cols,
 		table,
 	)
@@ -42,7 +36,6 @@ func newQueries(table string) queries {
 	return queries{
 		insert:           insert,
 		selectPending:    selectBase,
-		selectPendingTS:  selectWithTS,
 		updateFailureOne: updateFailureOne,
 		updateDeadOne:    updateDeadOne,
 		countPending:     countPending,

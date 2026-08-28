@@ -15,12 +15,14 @@ const (
 	uuidHexLength  = 32
 	uuidTextLength = 36
 
-	uuidVersionByte = 0x70
-	uuidVariantBits = 0x80
-	uuidVariantMask = 0x3f
-	randAMask       = 0x0fff
-	randANibbleMask = 0x0f
-	randBytesLength = 8
+	uuidVersionByte     = 0x70
+	uuidVersionMask     = 0xf0
+	uuidVariantBits     = 0x80
+	uuidVariantHighMask = 0xc0
+	uuidVariantMask     = 0x3f
+	randAMask           = 0x0fff
+	randANibbleMask     = 0x0f
+	randBytesLength     = 8
 
 	shift40 = 40
 	shift32 = 32
@@ -110,7 +112,8 @@ func (id ID) Value() (driver.Value, error) {
 	return id[:], nil
 }
 
-// ParseID parses a UUID string (canonical or 32 hex) into an ID.
+// ParseID parses the syntax of a UUID string (canonical or 32 hex) into an ID.
+// It does not enforce the UUID version so previously stored identifiers remain readable.
 func ParseID(value string) (ID, error) {
 	var hexbuf [uuidHexLength]byte
 	switch len(value) {
@@ -137,28 +140,9 @@ func ParseID(value string) (ID, error) {
 	return id, nil
 }
 
-func (id *ID) scanBytes(value []byte) error {
-	switch len(value) {
-	case uuidRawLength:
-		copy(id[:], value)
-
-		return nil
-	case uuidHexLength, uuidTextLength:
-		parsed, err := ParseID(string(value))
-		if err != nil {
-			return err
-		}
-		*id = parsed
-
-		return nil
-	default:
-		return ErrInvalidID
-	}
-}
-
 // IDGenerator creates new identifiers.
 type IDGenerator interface {
-	// New returns a new identifier.
+	// New returns a new RFC 9562 UUIDv7 identifier.
 	New() (ID, error)
 }
 
@@ -198,6 +182,30 @@ func (g *UUIDv7Generator) New() (ID, error) {
 	id := buildUUIDv7(now, g.seq, randBytes)
 
 	return id, nil
+}
+
+func (id ID) isUUIDv7() bool {
+	return id[6]&uuidVersionMask == uuidVersionByte &&
+		id[8]&uuidVariantHighMask == uuidVariantBits
+}
+
+func (id *ID) scanBytes(value []byte) error {
+	switch len(value) {
+	case uuidRawLength:
+		copy(id[:], value)
+
+		return nil
+	case uuidHexLength, uuidTextLength:
+		parsed, err := ParseID(string(value))
+		if err != nil {
+			return err
+		}
+		*id = parsed
+
+		return nil
+	default:
+		return ErrInvalidID
+	}
 }
 
 func (g *UUIDv7Generator) nextTimestamp() (int64, error) {

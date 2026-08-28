@@ -5,6 +5,8 @@ import (
 	"strings"
 )
 
+const maxPartitionNameLength = 64
+
 func sanitizeTableName(name string) (string, error) {
 	if name == "" {
 		return "", ErrTableNameRequired
@@ -24,4 +26,23 @@ func sanitizeTableName(name string) (string, error) {
 	}
 
 	return name, nil
+}
+
+func quotePartitionName(name string) (string, error) {
+	if name == "" || len(name) > maxPartitionNameLength {
+		return "", ErrInvalidPartition
+	}
+	for i := 0; i < len(name); i++ {
+		char := name[i]
+		if char == '_' || (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') {
+			continue
+		}
+		if i > 0 && char >= '0' && char <= '9' {
+			continue
+		}
+
+		return "", ErrInvalidPartition
+	}
+
+	return "`" + name + "`", nil
 }

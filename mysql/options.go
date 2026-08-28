@@ -74,7 +74,7 @@ func WithClock(clock outbox.Clock) Option {
 	}
 }
 
-// WithGenerator sets the UUID generator.
+// WithGenerator sets a generator that must return RFC 9562 UUIDv7 identifiers.
 func WithGenerator(gen outbox.IDGenerator) Option {
 	return func(c *Config) {
 		c.Generator = gen

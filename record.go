@@ -17,8 +17,11 @@ type Record struct {
 	Attempts      int
 }
 
-// Failure captures a processing error for a record.
+// Failure describes the error detail a Batch may persist for a record.
+// Relay-created failures contain stable summaries without handler error details.
 type Failure struct {
-	ID  ID
+	ID ID
+	// Err is the persistence detail. Direct Batch callers are responsible for
+	// excluding secrets from errors they provide.
 	Err error
 }

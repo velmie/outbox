@@ -1,17 +1,16 @@
 # outbox
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/velmie/outbox.svg)](https://pkg.go.dev/github.com/velmie/outbox)
-[![Go Report Card](https://goreportcard.com/badge/github.com/velmie/outbox)](https://goreportcard.com/report/github.com/velmie/outbox)
-[![Go Version](https://img.shields.io/badge/go-1.24%2B-00ADD8?logo=go)](go.mod)
+[![Go Version](https://img.shields.io/badge/go-1.25%2B-00ADD8?logo=go)](go.mod)
 [![License](https://img.shields.io/github/license/velmie/outbox)](LICENSE)
 
 `outbox` is a high-performance transactional outbox library. It ships with a MySQL 8.0+ backend optimized for polling
 with
-`READ COMMITTED` + `SKIP LOCKED`, UUID v7 identifiers in `BINARY(16)`, batch processing, and optional partition pruning.
+`READ COMMITTED` + `SKIP LOCKED`, UUID v7 identifiers in `BINARY(16)`, batch processing, and partition-based retention.
 
 ## Installation
 
-Requires Go 1.24+.
+Requires Go 1.25+.
 
 ```bash
 go get github.com/velmie/outbox
@@ -21,6 +20,10 @@ go get github.com/velmie/outbox/mysql
 Install `github.com/velmie/outbox/mysql` when you use the MySQL adapter.
 
 ## Quick Start
+
+Create the outbox table before starting the service. Generate its DDL with `mysql.Schema` or
+`mysql.PartitionedSchema` and apply it through your normal migration or bootstrap identity; the runtime application
+identity should not need schema-management privileges.
 
 ```go
 package main
@@ -45,7 +48,7 @@ import (
 func main() {
 	dsn := os.Getenv("OUTBOX_DSN")
 	if dsn == "" {
-		dsn = "root:secret@tcp(localhost:3306)/app?parseTime=true"
+		log.Fatal("OUTBOX_DSN is required")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -56,14 +59,6 @@ func main() {
 		log.Fatal(err)
 	}
 	defer db.Close()
-
-	schema, err := mysql.Schema("outbox")
-	if err != nil {
-		log.Fatal(err)
-	}
-	if _, err := db.ExecContext(ctx, schema); err != nil {
-		log.Fatal(err)
-	}
 
 	store, err := mysql.NewStore(db)
 	if err != nil {
@@ -98,7 +93,6 @@ func main() {
 		outbox.WithBatchSize(50),
 		outbox.WithWorkers(4),
 		outbox.WithPollInterval(50*time.Millisecond),
-		// outbox.WithPartitionWindow(1*time.Hour), // enable only with partitioned tables
 	)
 
 	if err := relay.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -111,9 +105,12 @@ func main() {
 
 1. Your business transaction writes both domain data and an outbox entry.
 2. A relay polls outbox rows with `SELECT ... FOR UPDATE SKIP LOCKED`.
-3. Each record is handed to a handler and then marked `processed` or `dead`.
+3. Each record is handed to a handler and then marked `processed`, left `pending` for retry, or marked `dead`.
 
-At-least-once delivery means handlers must be idempotent.
+The polling predicate considers the entire pending backlog; pending records do not become ineligible as they age.
+Delivery is at least once: publication may succeed before the relay can acknowledge and commit the row, so handlers
+and downstream consumers must be idempotent. Publish `Record.ID` as the stable message identifier so downstream
+consumers can deduplicate retries.
 
 ## Package layout
 
@@ -127,8 +124,9 @@ At-least-once delivery means handlers must be idempotent.
 
 ## MySQL schema
 
-Generate with `mysql.Schema("outbox")` or use the template below.
-The schema is tuned for UUID v7 + polling, with `created_ts` used for partitioning and pruning.
+Generate with `mysql.Schema("outbox")` or use the template below. Apply generated DDL through a controlled migration;
+`CREATE TABLE IF NOT EXISTS` does not convert an existing table to InnoDB or change its partition layout.
+The schema is tuned for UUID v7 + polling, with `created_ts` used as the partition key for retention.
 
 ```sql
 CREATE TABLE IF NOT EXISTS outbox
@@ -148,7 +146,7 @@ CREATE TABLE IF NOT EXISTS outbox
     created_ts     BIGINT GENERATED ALWAYS AS (CONV(SUBSTR(HEX(id), 1, 12), 16, 10) DIV 1000) STORED,
     PRIMARY KEY (id, created_ts),
     INDEX idx_status_id (status, id)
-);
+) ENGINE=InnoDB;
 ```
 
 ### Partitioning (optional, recommended for fast cleanup)
@@ -171,10 +169,8 @@ CREATE TABLE IF NOT EXISTS outbox
     created_ts     BIGINT GENERATED ALWAYS AS (CONV(SUBSTR(HEX(id), 1, 12), 16, 10) DIV 1000) STORED,
     PRIMARY KEY (id, created_ts),
     INDEX idx_status_id (status, id)
-)
+) ENGINE=InnoDB
 PARTITION BY RANGE (created_ts) (
-    PARTITION p202512 VALUES LESS THAN (1767225600),
-    PARTITION p202601 VALUES LESS THAN (1769904000),
     PARTITION pmax VALUES LESS THAN (MAXVALUE)
 );
 ```
@@ -219,8 +215,6 @@ import (
 
 func main() {
 	partitions := []mysql.Partition{
-		{Name: "p202512", LessThan: "1767225600"},
-		{Name: "p202601", LessThan: "1769904000"},
 		{Name: "pmax", LessThan: "MAXVALUE"},
 	}
 
@@ -250,7 +244,7 @@ import (
 func main() {
 	dsn := os.Getenv("OUTBOX_DSN")
 	if dsn == "" {
-		dsn = "root:secret@tcp(localhost:3306)/app?parseTime=true"
+		log.Fatal("OUTBOX_DSN is required")
 	}
 
 	db, err := sql.Open("mysql", dsn)
@@ -272,14 +266,22 @@ Two options are supported:
 1. **Embedded maintainer** (inside your service) when the app can run `ALTER TABLE`.
 2. **Standalone CLI** (cron / Kubernetes CronJob) when `ALTER` is not allowed in the app.
 
-The maintainer uses `GET_LOCK` and `information_schema.PARTITIONS`, so ensure the DB user has `ALTER` and `SELECT` on
-`information_schema`.
+The maintainer uses `GET_LOCK` and reads `information_schema`. Partition creation needs `SELECT`, `ALTER`, `CREATE`,
+and `INSERT` on the target table/schema. Retention additionally needs `DROP` and schema-level `LOCK TABLES`;
+without `Retention`, those two privileges are not used.
+
+Use one stable lock name for the same operation and table across all instances. `LockName` and `-lock-name` must contain
+1-64 valid UTF-8 characters. The default is `outbox:partitions:<table>`; set a shorter explicit name when a qualified
+table name would make the default too long.
 
 Behavior overview:
 
-- On startup it verifies the table is range partitioned by `created_ts`.
+- On startup it verifies the table is InnoDB and partitioned by `RANGE(created_ts)` without subpartitions.
 - It creates missing partitions for the configured lookahead window using the chosen period.
-- If `Retention` is set it drops partitions older than now minus retention.
+- If `Retention` is set it drops eligible partitions only when all their rows are terminal
+  (`processed` or `dead`). Any non-terminal row aborts that destructive pass before DDL.
+- The terminal-state check and one exclusive, in-place `DROP PARTITION` run behind a short
+  `LOCK TABLES ... WRITE` fence, so concurrent enqueue waits and cannot enter a checked partition.
 - It repeats this work every `CheckEvery` interval and exits on context cancel.
 
 Embedded usage:
@@ -305,7 +307,7 @@ import (
 func main() {
 	dsn := os.Getenv("OUTBOX_DSN")
 	if dsn == "" {
-		dsn = "root:secret@tcp(localhost:3306)/app?parseTime=true"
+		log.Fatal("OUTBOX_DSN is required")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -334,12 +336,13 @@ func main() {
 }
 ```
 
-CLI usage (run on schedule with a DB user that can `ALTER`):
+CLI usage (run on schedule with a dedicated maintenance identity). Supply `OUTBOX_DSN`
+through the process environment or a secret manager. The `-dsn` flag remains available
+for compatibility in v0.2.0, but it is deprecated because command arguments can be inspected.
 
 ```bash
 cd cmd/outbox-partitions
 go run . \
-  -dsn "user:pass@tcp(localhost:3306)/app?parseTime=true" \
   -table outbox \
   -period day \
   -lookahead 720h \
@@ -351,7 +354,8 @@ CLI details:
 
 - The CLI performs the same plan as the embedded maintainer.
 - It creates missing partitions for the requested lookahead and period.
-- With `-retention` it deletes partitions older than the retention cutoff.
+- With `-retention` it deletes terminal-only partitions older than the retention cutoff.
+- `-lookahead=0` uses 30 days for daily partitions or 90 days for monthly partitions; `-retention=0` disables removal.
 - With `-once` it runs a single maintenance cycle and exits.
 - Without `-once` it stays running and repeats every `-check-every`.
 
@@ -377,7 +381,7 @@ import (
 func main() {
 	dsn := os.Getenv("OUTBOX_DSN")
 	if dsn == "" {
-		dsn = "root:secret@tcp(localhost:3306)/app?parseTime=true"
+		log.Fatal("OUTBOX_DSN is required")
 	}
 
 	db, err := sql.Open("mysql", dsn)
@@ -426,7 +430,7 @@ import (
 func main() {
 	dsn := os.Getenv("OUTBOX_DSN")
 	if dsn == "" {
-		dsn = "root:secret@tcp(localhost:3306)/app?parseTime=true"
+		log.Fatal("OUTBOX_DSN is required")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -455,10 +459,12 @@ func main() {
 }
 ```
 
+Supply `OUTBOX_DSN` through the process environment or a secret manager. The
+deprecated `-dsn` flag is retained for compatibility in v0.2.0.
+
 ```bash
 cd cmd/outbox-cleanup
 go run . \
-  -dsn "user:pass@tcp(localhost:3306)/app?parseTime=true" \
   -table outbox \
   -retention 168h \
   -limit 10000 \
@@ -466,13 +472,16 @@ go run . \
   -once
 ```
 
+Cleanup requires a positive `-retention`. A zero `-limit` uses 10000 rows per batch. The cleanup identity needs
+`SELECT` and `DELETE`, but no DDL privileges. Its default lock name is `outbox:cleanup:<table>` and follows the same
+1-64 character rule as partition maintenance.
+
 ## Polling query (MySQL 8.0+)
 
 ```sql
-SELECT id, aggregate_type, aggregate_id, event_type, payload, headers
+SELECT id, aggregate_type, aggregate_id, event_type, payload, headers, created_at, attempt_count
 FROM outbox
 WHERE status = 0
-  AND created_ts >= ? -- optional, for partition pruning
 ORDER BY id ASC
 LIMIT 50
 FOR UPDATE SKIP LOCKED;
@@ -481,14 +490,22 @@ FOR UPDATE SKIP LOCKED;
 ## Practical notes
 
 - Use `READ COMMITTED` for polling sessions to avoid gap locks.
-- Use UUID v7 in `BINARY(16)` to keep inserts append-only in the clustered index.
+- Use UUID v7 in `BINARY(16)` to preserve time locality in the clustered index.
 - Prefer batch sizes between 50-200; too small increases round trips, too large holds locks longer.
 - JSON validation is enabled by default. Use `mysql.WithValidatePayload`/`mysql.WithValidateHeaders` or
   `mysql.WithValidateJSON(false)` for fine-grained control.
 - Run multiple workers in parallel; `SKIP LOCKED` provides safe work stealing.
-- Set `PartitionWindow` only with partitioned tables to keep scans within hot partitions.
+- Polling considers every pending row, including rows with old UUID timestamps. `WithPartitionWindow`,
+  `RelayConfig.PartitionWindow`, and `FetchOptions.MinCreatedAt` are deprecated and ignored.
+- A non-zero `Entry.ID` must be an RFC 9562 UUID v7. Its timestamp may be old; zero IDs use the configured generator.
 - Keep handler processing short; avoid network retries inside the DB transaction.
-- Use `WithHandlerTimeout` to cap per-record processing time and release locks faster.
+- `WithHandlerTimeout` gives each call a cooperative context deadline. The relay calls `Handle` synchronously and
+  waits for it to return, so the handler must observe `ctx` to finish near the deadline.
+- Relay-created failure details for returned errors, recovered handler panics, and errors returned after an elapsed
+  handler deadline are limited to `outbox handler failed`, `outbox handler panicked`, and `outbox handler timed out`.
+  Panic values are discarded.
+- `WithErrorHandler` and `WithFailureClassifier` receive the original returned handler error and full record for
+  diagnostics and policy. These explicitly configured callbacks must not log or persist secrets blindly.
 - Use `WithFailureClassifier` to mark non-retryable failures as dead immediately.
 - Raise `max_allowed_packet` if your JSON payloads can be large.
 
@@ -537,7 +554,7 @@ func (stdLogger) Error(msg string, args ...any) { log.Printf("ERROR %s %v", msg,
 func main() {
 	dsn := os.Getenv("OUTBOX_DSN")
 	if dsn == "" {
-		dsn = "root:secret@tcp(localhost:3306)/app?parseTime=true"
+		log.Fatal("OUTBOX_DSN is required")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -548,14 +565,6 @@ func main() {
 		log.Fatal(err)
 	}
 	defer db.Close()
-
-	schema, err := mysql.Schema("outbox")
-	if err != nil {
-		log.Fatal(err)
-	}
-	if _, err := db.ExecContext(ctx, schema); err != nil {
-		log.Fatal(err)
-	}
 
 	store, err := mysql.NewStore(db)
 	if err != nil {
@@ -610,24 +619,31 @@ below is mostly durability and storage cost.
 | Fast      | tmpfs, relaxed durability | ~51k msg/s (8x100)  | ~18.7k msg/s (~10 ms) | ~36k msg/s   |
 
 Raw insert baseline (`use_tx=false`) is ~211 msg/s (prod-like) and ~53k msg/s (fast).
-Full reports: [docs/benchmarks/results/20251225T225119Z/report.md](docs/benchmarks/results/20251225T225119Z/report.md) and
+Historical reports: [docs/benchmarks/results/20251225T225119Z/report.md](docs/benchmarks/results/20251225T225119Z/report.md) and
 [docs/benchmarks/results/20251228T165819Z/report.md](docs/benchmarks/results/20251228T165819Z/report.md).
+They describe the repository revision that produced them; use the active benchmark documentation for current behavior.
 Reproduce: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Docs
 
 See [docs/guide.md](docs/guide.md) for architecture, tuning, failure handling, cleanup, and extension notes.
 See [docs/benchmarks.md](docs/benchmarks.md) for the research harness and plotting workflow.
+See [docs/migration-v0.2.0.md](docs/migration-v0.2.0.md) before upgrading from v0.1.1.
+See [docs/release-v0.2.0.md](docs/release-v0.2.0.md) for the v0.2.0 release notes.
 
 ## Testing
 
 ```bash
-go test ./...
+for module in . mysql cmd; do
+  (cd "$module" && go test -race ./... && go vet ./...)
+done
 
-go test -tags=integration ./...
+(cd mysql && go test -count=1 -tags=integration -timeout 12m ./...)
+(cd cmd && go test -count=1 -tags=integration -timeout 12m ./...)
 ```
 
-Integration tests use testcontainers and require Docker.
+The committed `go.work` makes the nested modules use the current checkout. Integration tests use Testcontainers and
+require a working Docker daemon; container startup failures fail the suite.
 CLI integration tests in `cmd/outbox-cleanup` and `cmd/outbox-partitions` build the binaries and run them in a container against a real MySQL container.
 
 Run only the CLI integration tests:
@@ -640,8 +656,16 @@ go test -tags=integration -timeout 5m ./outbox-cleanup ./outbox-partitions
 ## Lint
 
 ```bash
-docker run --rm -v "$(pwd)":/app:ro -w /app golangci/golangci-lint:v2.5.0 golangci-lint run ./...
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+repo_root="$(pwd)"
+for module in . mysql cmd; do
+  (cd "$module" && golangci-lint run --config "$repo_root/.golangci.yml" ./...)
+done
 ```
+
+The complete gate requires Go 1.26.7, Git, tar, zip, Docker, golangci-lint 2.12.2, govulncheck 1.7.0, and Trivy 0.74.0.
+Run `./scripts/verify.sh` for the root, `mysql`, and `cmd` release gate. It verifies the future v0.2.0 module graph
+without `go.work`, then runs integration tests, `govulncheck`, and Trivy.
 
 ## License
 

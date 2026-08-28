@@ -25,8 +25,8 @@ var (
 	ErrPartitionDescriptionInvalid = errors.New("outbox mysql: invalid partition description")
 	// ErrPartitionNameConflict is returned when a generated partition name already exists.
 	ErrPartitionNameConflict = errors.New("outbox mysql: partition name conflict")
-	// ErrPartitionedTableRequired is returned when the table is not partitioned.
-	ErrPartitionedTableRequired = errors.New("outbox mysql: table is not partitioned")
+	// ErrPartitionedTableRequired is returned when the table is not InnoDB RANGE(created_ts) partitioned.
+	ErrPartitionedTableRequired = errors.New("outbox mysql: table must use InnoDB RANGE(created_ts) partitioning")
 	// ErrPartitionMaxRequired is returned when MAXVALUE partition is missing.
 	ErrPartitionMaxRequired = errors.New("outbox mysql: MAXVALUE partition is required")
 	// ErrCleanupBeforeRequired is returned when cleanup cutoff is missing.

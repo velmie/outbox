@@ -3,11 +3,6 @@ issues: {}
 run:
   timeout: 5m
   tests: false
-  skip-dirs:
-    - tilt_modules
-    - vendor
-  skip-files:
-    - ".*/mock/.*\\.go$"
 linters:
   default: none
   enable:
@@ -134,7 +129,17 @@ linters:
       - linters:
           - cyclop
         path: (.+)_test\.go
+      - linters:
+          - gosec
+        path: (^|/)id\.go$
+        text: G115
+      - linters:
+          - perfsprint
+        path: (^|/)mysql/schema\.go$
+        text: concat-loop
     paths:
+      - .*/mock/.*\.go$
+      - tilt_modules
       - vendor
 
 formatters:
@@ -148,6 +153,6 @@ formatters:
   exclusions:
     generated: lax
     paths:
+      - .*/mock/.*\.go$
+      - tilt_modules
       - vendor
-
-linters-settings:

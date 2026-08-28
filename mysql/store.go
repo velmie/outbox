@@ -85,6 +85,13 @@ func (s *Store) Enqueue(ctx context.Context, exec Executor, entry outbox.Entry) 
 		if err != nil {
 			return outbox.ID{}, fmt.Errorf("outbox mysql: generate id failed: %w", err)
 		}
+		if id.IsZero() {
+			return outbox.ID{}, fmt.Errorf("outbox mysql: generate id failed: %w", outbox.ErrInvalidID)
+		}
+		entry.ID = id
+		if err := outbox.ValidateEntryWithOptions(entry, false, false); err != nil {
+			return outbox.ID{}, fmt.Errorf("outbox mysql: generate id failed: %w", err)
+		}
 	}
 
 	headers := any(nil)
@@ -136,16 +143,7 @@ func (s *Store) Fetch(ctx context.Context, opts outbox.FetchOptions) (outbox.Bat
 }
 
 func (s *Store) selectBatch(ctx context.Context, tx *sql.Tx, opts outbox.FetchOptions) ([]outbox.Record, error) {
-	var (
-		rows *sql.Rows
-		err  error
-	)
-
-	if opts.MinCreatedAt.IsZero() {
-		rows, err = tx.QueryContext(ctx, s.queries.selectPending, outbox.StatusPending, opts.BatchSize)
-	} else {
-		rows, err = tx.QueryContext(ctx, s.queries.selectPendingTS, outbox.StatusPending, createdTS(opts.MinCreatedAt), opts.BatchSize)
-	}
+	rows, err := tx.QueryContext(ctx, s.queries.selectPending, outbox.StatusPending, opts.BatchSize)
 	if err != nil {
 		return nil, fmt.Errorf("outbox mysql: select failed: %w", err)
 	}
@@ -279,10 +277,6 @@ func makePlaceholders(count int) string {
 	}
 
 	return string(buf)
-}
-
-func createdTS(t time.Time) int64 {
-	return t.UTC().Unix()
 }
 
 func truncateError(err error) string {

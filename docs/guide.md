@@ -1,12 +1,15 @@
 # outbox guide
 
-This document explains every aspect of the library and summarizes practical recommendations for production use.
+This guide covers the root library and MySQL adapter for production use. All repository modules require Go 1.25+;
+the MySQL adapter requires MySQL 8.0+.
+
+For the v0.1.1 to v0.2.0 transition, follow [the migration guide](migration-v0.2.0.md).
 
 ## Goals
 
 - Solve the dual-write problem using a transactional outbox.
 - Stay polling-based without sacrificing throughput on MySQL 8.0+.
-- Provide clean, SOLID abstractions for future adapters (Postgres, SQL Server, etc).
+- Keep adapter boundaries small enough for another database implementation when one has a current consumer.
 
 ## Core concepts
 
@@ -21,7 +24,7 @@ Required fields:
 Optional fields:
 - `AggregateID` (stream instance id)
 - `Headers` (JSON metadata)
-- `ID` (if zero, UUID v7 is generated)
+- `ID` (if zero, UUID v7 is generated; a non-zero value must be an RFC 9562 UUID v7, but its timestamp may be old)
 
 ### Record
 
@@ -35,7 +38,7 @@ Optional fields:
 Records move through these states:
 - `StatusPending` (0): ready for processing
 - `StatusProcessed` (1): processed successfully
-- `StatusDead` (-1): exceeded retry attempts and moved to DLQ
+- `StatusDead` (-1): terminal because retries were exhausted or a classifier marked the failure non-retryable
 
 ## Flow
 
@@ -44,7 +47,9 @@ Records move through these states:
 3. Commit the transaction.
 4. A `Relay` polls, locks, processes, and updates outbox rows.
 
-At-least-once delivery means handlers must be idempotent.
+Delivery is at least once: publication may succeed before the relay can acknowledge and commit the row, so handlers
+and downstream consumers must be idempotent. Publish `Record.ID` as the stable message identifier so downstream
+consumers can deduplicate retries.
 
 ## Core API
 
@@ -56,7 +61,9 @@ At-least-once delivery means handlers must be idempotent.
 err := handler.Handle(ctx, record)
 ```
 
-Errors trigger retry accounting. You can register an optional `FailureHandler` for logging/metrics.
+Errors and handler panics trigger retry/dead accounting. Relay-created `Failure.Err` values contain only stable,
+secret-safe summaries. You can register an optional `FailureHandler` for logging or metrics; it receives the original
+returned handler error and full record, so it owns safe handling of those details. Panic values are discarded.
 
 ### Consumer and Batch
 
@@ -76,7 +83,8 @@ Contract note: `Fetch` must return `ErrNoRecords` when there is no work and must
 - `ProcessOnce` processes a single batch.
 
 Useful options:
-- `WithHandlerTimeout` to cap per-record processing time.
+- `WithHandlerTimeout` to give each handler call a cooperative context deadline. Relay invokes `Handle` synchronously
+  and waits for it to return; a handler that ignores `ctx` is not forcibly interrupted.
 - `WithFailureClassifier` to decide retry vs dead-letter on errors.
 - `WithLogger` / `WithMetrics` to plug in observability.
 - `WithPendingInterval` to enable pending sampling and set the minimum interval.
@@ -88,10 +96,9 @@ Useful options:
 The adapter uses a single optimized query:
 
 ```sql
-SELECT id, aggregate_type, aggregate_id, event_type, payload, headers
+SELECT id, aggregate_type, aggregate_id, event_type, payload, headers, created_at, attempt_count
 FROM outbox
 WHERE status = 0
-  AND created_ts >= ? -- optional for pruning
 ORDER BY id ASC
 LIMIT ?
 FOR UPDATE SKIP LOCKED;
@@ -102,6 +109,7 @@ Key properties:
 - `SKIP LOCKED` allows multiple workers to progress without waiting.
 - `ORDER BY id` benefits from UUID v7 ordering.
 - `LIMIT` keeps transactions short.
+- The predicate considers the entire pending backlog; pending rows remain eligible regardless of UUID timestamp.
 
 ### Enqueue semantics
 
@@ -132,7 +140,8 @@ store, err := mysql.NewStore(db, mysql.WithValidatePayload(false))
 
 Each `Fail` call:
 - increments `attempt_count`
-- sets `last_error` (truncated to 1024 chars)
+- sets `last_error` (truncated to 1024 chars). Relay-created failures use only `outbox handler failed`,
+  `outbox handler panicked`, or `outbox handler timed out`; direct `Batch.Fail` callers own the safety of supplied errors.
 - keeps `status = pending` until `attempt_count` reaches `MaxAttempts`, then sets `status = dead`
 
 `Relay` can classify failures with `FailureClassifier`. When it returns:
@@ -147,11 +156,15 @@ SELECT * FROM outbox WHERE status = -1 ORDER BY created_at DESC;
 
 ## Schema guidance
 
+Generate schema DDL with the package helpers and apply it through a controlled migration or bootstrap identity. The
+runtime application identity should not need schema-management privileges. `CREATE TABLE IF NOT EXISTS` does not
+convert an existing table to InnoDB or change its partition layout.
+
 ### UUID v7 in BINARY(16)
 
 - UUID v7 is time ordered (48-bit Unix milliseconds prefix).
 - `BINARY(16)` halves index size vs `CHAR(36)` and improves cache locality.
-- `ORDER BY id` is chronological for UUID v7.
+- `ORDER BY id` benefits from UUIDv7 time locality.
 
 ### Generated timestamp for partitioning
 
@@ -161,7 +174,7 @@ The schema includes a `created_ts` column derived from UUID v7:
 created_ts BIGINT GENERATED ALWAYS AS (CONV(SUBSTR(HEX(id), 1, 12), 16, 10) DIV 1000) STORED
 ```
 
-- It stores Unix seconds and supports partition pruning.
+- It stores Unix seconds and provides the range-partition key used for retention and rotation.
 - MySQL requires `STORED` when the column participates in the primary key.
 - The expression is evaluated on insert. For very high ingest rates, budget CPU accordingly.
 
@@ -171,13 +184,16 @@ created_ts BIGINT GENERATED ALWAYS AS (CONV(SUBSTR(HEX(id), 1, 12), 16, 10) DIV 
 
 ### Partitioning + cleanup
 
-Use range partitions on `created_ts` and drop old partitions instead of deleting rows:
+Use InnoDB range partitions on `created_ts` and drop old, terminal-only partitions instead of deleting rows.
+`DROP PARTITION` discards every row in the target partition, so use the maintainer below to fence concurrent
+enqueue and verify terminal state before DDL:
 
 ```sql
 ALTER TABLE outbox DROP PARTITION p202501;
 ```
 
-This is instant and avoids expensive delete/undo work.
+For `RANGE` partitions MySQL can perform this in place without copying the remaining table, avoiding expensive
+row-by-row delete/undo work.
 
 #### Why `pmax` matters
 
@@ -194,35 +210,44 @@ ALTER TABLE outbox REORGANIZE PARTITION pmax INTO (
     PARTITION pmax VALUES LESS THAN (MAXVALUE)
 );
 
--- Drop partitions outside your retention window.
-ALTER TABLE outbox DROP PARTITION p20250201;
+-- Destructive: the maintainer runs this only after its locked terminal-state check.
+ALTER TABLE outbox ALGORITHM=INPLACE, LOCK=EXCLUSIVE, DROP PARTITION p20250201;
 ```
 
-Cron example (pseudo):
-
-```
-0 2 * * * mysql -u app -p*** appdb -e "ALTER TABLE outbox REORGANIZE PARTITION pmax INTO (PARTITION p$(date -u +%Y%m%d) VALUES LESS THAN (UNIX_TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 1 DAY))), PARTITION pmax VALUES LESS THAN (MAXVALUE));"
-```
+Prefer the built-in maintainer or standalone CLI below instead of embedding database
+credentials and DDL in a cron command.
 
 #### Built-in partition maintainer
 
-`mysql.PartitionMaintainer` keeps partitions ahead of time and optionally drops old ones. It uses `GET_LOCK` on a single session, reads `information_schema.PARTITIONS`, and splits `pmax` via `REORGANIZE PARTITION` so missing ranges can be inserted before `MAXVALUE`.
+`mysql.PartitionMaintainer` keeps partitions ahead of time and optionally drops old, terminal-only ones. It verifies
+an InnoDB `RANGE(created_ts)` layout, uses `GET_LOCK` on a single session, reads `information_schema`, and splits
+`pmax` via `REORGANIZE PARTITION` so missing ranges can be inserted before `MAXVALUE`. Before destructive DDL it
+takes a short `LOCK TABLES ... WRITE` fence, revalidates and replans, and aborts without dropping anything if any
+candidate contains a non-terminal row. Concurrent enqueue waits for this fenced check/drop section and resumes
+against the remaining partition map.
 
 Partition names are generated as:
 - daily: `pYYYYMMDD`
 - monthly: `pYYYYMM`
 
-Use this when:
+Use the embedded maintainer only when granting DDL privileges to the service identity is an accepted deployment choice:
+
 - your service runs 24/7,
-- the DB user can run `ALTER TABLE`,
+- the DB user has the required maintenance grants,
 - you want the simplest deployment with no extra infrastructure.
 
 Permissions required:
-- `ALTER` on the outbox table.
-- `SELECT` on `information_schema.PARTITIONS`.
-- ability to call `GET_LOCK` / `RELEASE_LOCK` (built-in MySQL functions).
 
-Operational note: `ALTER TABLE` can take a metadata lock, so keep `CheckEvery` reasonably large (hourly/daily) and batch changes.
+- Partition creation needs `SELECT`, `ALTER`, `CREATE`, and `INSERT` on the target table/schema.
+- Retention additionally needs `DROP` and schema-level `LOCK TABLES`; without `Retention`, those privileges are unused.
+- `GET_LOCK` and `RELEASE_LOCK` are built-in MySQL functions and need no additional grant.
+
+Use one stable `LockName` across instances for the same operation and table. It must contain 1-64 valid UTF-8
+characters. The default is `outbox:partitions:<table>`; set a shorter explicit name when a qualified table name would
+make the default too long. A pass is skipped when another session owns the same named lock.
+
+Operational note: retention briefly blocks reads and writes while it verifies and drops eligible partitions, so keep
+`CheckEvery` reasonably large (hourly/daily) and batch changes.
 Operational note: DDL operations are logged at Info level via the maintainer logger.
 
 Example:
@@ -239,25 +264,28 @@ if err != nil {
 	return err
 }
 
-go func() {
-	_ = maintainer.Run(ctx)
-}()
+if err := maintainer.Run(ctx); err != nil {
+	return err // Treat context cancellation according to the service lifecycle.
+}
 ```
 
 #### Standalone CLI (cron / CronJob)
 
-Use the CLI when `ALTER` privileges cannot be granted to the app or when you want a dedicated ops job:
+Use the CLI when `ALTER` privileges cannot be granted to the app or when you want a dedicated ops job.
+Supply `OUTBOX_DSN` through the process environment or a secret manager. The `-dsn` flag remains
+available for compatibility in v0.2.0, but it is deprecated because command arguments can be inspected.
 
 ```bash
 cd cmd/outbox-partitions
 go run . \
-  -dsn "user:pass@tcp(localhost:3306)/app?parseTime=true" \
   -table outbox \
   -period day \
   -lookahead 720h \
   -retention 168h \
   -once
 ```
+
+`-lookahead=0` uses 30 days for daily partitions or 90 days for monthly partitions. `-retention=0` disables removal.
 
 ### Non-partitioned cleanup (batch DELETE)
 
@@ -291,23 +319,27 @@ if err != nil {
 	return err
 }
 
-go func() {
-	_ = maintainer.Run(ctx)
-}()
+if err := maintainer.Run(ctx); err != nil {
+	return err // Treat context cancellation according to the service lifecycle.
+}
 ```
 
-Standalone CLI (cron / CronJob):
+Standalone CLI (cron / CronJob). Supply `OUTBOX_DSN` through the process environment
+or a secret manager; the deprecated `-dsn` flag is retained for compatibility in v0.2.0:
 
 ```bash
 cd cmd/outbox-cleanup
 go run . \
-  -dsn "user:pass@tcp(localhost:3306)/app?parseTime=true" \
   -table outbox \
   -retention 168h \
   -limit 10000 \
   -include-dead \
   -once
 ```
+
+Cleanup requires a positive `Retention` or `-retention`. A zero `Limit` or `-limit` uses 10000 rows per batch. The
+cleanup identity needs `SELECT` and `DELETE`, but no DDL privileges. Use one stable 1-64 character lock name across
+instances; the default is `outbox:cleanup:<table>`. A pass is skipped while another session owns that name.
 
 Operational note: batched deletes can still create I/O and undo pressure. For large tables, prefer partitioning or schedule cleanup during off-peak hours. If cleanup becomes slow, consider adding composite indexes for the cutoff columns (for example, `(status, processed_at)` or `(status, updated_at)`).
 
@@ -320,12 +352,14 @@ The CLI reuses the same maintainer logic, so behavior is identical; it just runs
 - Start with batch size 50 and scale to 100 based on handler latency.
 - Set worker count to the number of CPU cores or slightly above.
 - Keep handler work short; avoid network retries inside the DB transaction.
-- Set `WithHandlerTimeout` to avoid stuck handlers. Default `0` means no timeout.
+- Set `WithHandlerTimeout` to provide a cooperative deadline. Default `0` means no added deadline. The relay waits for
+  `Handle` to return, so handlers must observe context cancellation; the option does not forcibly stop stuck code.
 
-### Partition pruning
+### Pending eligibility
 
-- Use `Relay.WithPartitionWindow` (e.g. 1h) to limit scans to hot partitions.
-- Set partitions that match operational retention (daily or hourly partitions).
+- Polling considers every pending row, including rows with old UUID timestamps.
+- `outbox.WithPartitionWindow`, `RelayConfig.PartitionWindow`, and `FetchOptions.MinCreatedAt` are deprecated and ignored.
+- Set daily or hourly partitions to match operational retention and cleanup needs, not to exclude older pending rows.
 
 ### MySQL tuning
 
@@ -338,7 +372,10 @@ Recommended baseline for write-heavy outbox tables:
 
 ### Error handling
 
-- Provide a `FailureHandler` to capture metrics and logs.
+- A handler panic becomes a generic per-record failure and does not stop the worker. Other panics before commit roll
+  back the batch; `Run` reports `ErrWorkerPanic` without the panic value.
+- Provide a `FailureHandler` to capture metrics and logs. It and `FailureClassifier` receive the original returned
+  handler error and full record, so configured callbacks must avoid exposing sensitive values.
 - Route `status = -1` rows to a manual DLQ workflow.
 
 ### Observability
@@ -377,6 +414,6 @@ Keep the same contract:
 
 ## Testing and benchmarks
 
-- Unit tests: `go test ./...`
-- Integration tests (Docker): `go test -tags=integration ./...`
-- Benchmarks: `go test -bench=. ./...`
+- Complete release gate for all three modules: `./scripts/verify.sh`
+- Root-module benchmarks: `go test -bench=. ./...`
+- MySQL and CLI integration tests require a working Docker daemon and fail when their containers cannot start.

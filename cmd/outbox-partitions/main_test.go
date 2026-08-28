@@ -1,8 +1,6 @@
 package main
 
-import (
-	"testing"
-)
+import "testing"
 
 func TestResolveDSN(t *testing.T) {
 	t.Setenv(dsnEnvName, "from-environment")

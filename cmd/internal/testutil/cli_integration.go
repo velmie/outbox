@@ -4,6 +4,7 @@ package testutil
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"fmt"
 	"io"
@@ -14,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/go-connections/nat"
+	dockernetwork "github.com/moby/moby/api/types/network"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/network"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -23,11 +24,10 @@ import (
 )
 
 const (
-	mysqlImage          = "mysql:8.0.36"
+	mysqlImage          = "mysql:8.4.11@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb"
 	mysqlDatabase       = "outbox"
 	mysqlUser           = "root"
-	mysqlPassword       = "secret"
-	cliContainerImage   = "alpine:3.20"
+	cliContainerImage   = "busybox:1.38.0-musl@sha256:32b5cdad7cce41dfd53d0ae06baebcf8357a147ee7694dc706911c373bc30c37"
 	cliContainerPath    = "/cli"
 	cliExitTimeout      = 2 * time.Minute
 	mysqlStartupTimeout = 2 * time.Minute
@@ -38,6 +38,7 @@ type MySQLContainer struct {
 	Network   *testcontainers.DockerNetwork
 	DB        *sql.DB
 	DSN       string
+	Password  string
 }
 
 func StartMySQLContainer(t *testing.T, ctx context.Context) MySQLContainer {
@@ -45,29 +46,30 @@ func StartMySQLContainer(t *testing.T, ctx context.Context) MySQLContainer {
 
 	net, err := network.New(ctx)
 	if err != nil {
-		t.Skipf("create network: %v", err)
+		t.Fatalf("create network: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = net.Remove(ctx)
 	})
 
-	port := nat.Port("3306/tcp")
+	password := rand.Text()
+	port := "3306/tcp"
 	req := testcontainers.ContainerRequest{
 		Image:        mysqlImage,
-		ExposedPorts: []string{string(port)},
+		ExposedPorts: []string{port},
 		Env: map[string]string{
-			"MYSQL_ROOT_PASSWORD": mysqlPassword,
+			"MYSQL_ROOT_PASSWORD": password,
 			"MYSQL_DATABASE":      mysqlDatabase,
 		},
 		Networks: []string{net.Name},
 		NetworkAliases: map[string][]string{
 			net.Name: {"mysql"},
 		},
-		WaitingFor: wait.ForSQL(port, "mysql", func(host string, port nat.Port) string {
+		WaitingFor: wait.ForSQL(port, "mysql", func(host string, port dockernetwork.Port) string {
 			return fmt.Sprintf(
 				"%s:%s@tcp(%s:%s)/%s?parseTime=true&multiStatements=true",
 				mysqlUser,
-				mysqlPassword,
+				password,
 				host,
 				port.Port(),
 				mysqlDatabase,
@@ -80,7 +82,7 @@ func StartMySQLContainer(t *testing.T, ctx context.Context) MySQLContainer {
 		Started:          true,
 	})
 	if err != nil {
-		t.Skipf("start mysql container: %v", err)
+		t.Fatalf("start mysql container: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = container.Terminate(ctx)
@@ -98,7 +100,7 @@ func StartMySQLContainer(t *testing.T, ctx context.Context) MySQLContainer {
 	dsnHost := fmt.Sprintf(
 		"%s:%s@tcp(%s:%s)/%s?parseTime=true&multiStatements=true",
 		mysqlUser,
-		mysqlPassword,
+		password,
 		host,
 		mappedPort.Port(),
 		mysqlDatabase,
@@ -114,7 +116,7 @@ func StartMySQLContainer(t *testing.T, ctx context.Context) MySQLContainer {
 	containerDSN := fmt.Sprintf(
 		"%s:%s@tcp(mysql:3306)/%s?parseTime=true&multiStatements=true",
 		mysqlUser,
-		mysqlPassword,
+		password,
 		mysqlDatabase,
 	)
 
@@ -123,6 +125,7 @@ func StartMySQLContainer(t *testing.T, ctx context.Context) MySQLContainer {
 		Network:   net,
 		DB:        db,
 		DSN:       containerDSN,
+		Password:  password,
 	}
 }
 
@@ -152,13 +155,20 @@ func BuildBinary(t *testing.T, pkg string) string {
 	return bin
 }
 
-func RunCLIContainer(t *testing.T, ctx context.Context, networkName, binaryPath string, args []string) (int, string) {
+func RunCLIContainer(
+	t *testing.T,
+	ctx context.Context,
+	networkName, binaryPath string,
+	env map[string]string,
+	args []string,
+) (int, string) {
 	t.Helper()
 
 	req := testcontainers.ContainerRequest{
 		Image:      cliContainerImage,
 		Entrypoint: []string{cliContainerPath},
 		Cmd:        args,
+		Env:        env,
 		Networks:   []string{networkName},
 		Files: []testcontainers.ContainerFile{
 			{

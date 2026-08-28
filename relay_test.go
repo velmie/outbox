@@ -3,8 +3,11 @@ package outbox
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -29,6 +32,7 @@ type fakeBatch struct {
 	deadErr   error
 	commitErr error
 	rollErr   error
+	rollCalls int
 }
 
 type fakeBatchNoDead struct {
@@ -41,6 +45,7 @@ type fakeBatchNoDead struct {
 	failErr   error
 	commitErr error
 	rollErr   error
+	rollCalls int
 }
 
 func (b *fakeBatchNoDead) Records() []Record {
@@ -63,6 +68,7 @@ func (b *fakeBatchNoDead) Commit() error {
 }
 
 func (b *fakeBatchNoDead) Rollback() error {
+	b.rollCalls++
 	b.rolled = true
 	return b.rollErr
 }
@@ -92,6 +98,7 @@ func (b *fakeBatch) Commit() error {
 }
 
 func (b *fakeBatch) Rollback() error {
+	b.rollCalls++
 	b.rolled = true
 	return b.rollErr
 }
@@ -146,6 +153,10 @@ type captureMetrics struct {
 	pendingCalls int
 }
 
+type captureLogger struct {
+	entries []string
+}
+
 func (captureMetrics) ObserveBatchDuration(time.Duration) {}
 func (captureMetrics) AddProcessed(int)                   {}
 func (captureMetrics) AddErrors(int)                      {}
@@ -154,6 +165,35 @@ func (captureMetrics) AddDead(int)                        {}
 func (m *captureMetrics) SetPending(count int) {
 	m.pending = count
 	m.pendingCalls++
+}
+
+func (l *captureLogger) Debug(msg string, args ...any) {
+	l.capture(msg, args...)
+}
+
+func (l *captureLogger) Info(msg string, args ...any) {
+	l.capture(msg, args...)
+}
+
+func (l *captureLogger) Warn(msg string, args ...any) {
+	l.capture(msg, args...)
+}
+
+func (l *captureLogger) Error(msg string, args ...any) {
+	l.capture(msg, args...)
+}
+
+func (l *captureLogger) capture(msg string, args ...any) {
+	l.entries = append(l.entries, fmt.Sprintf("%s %v", msg, args))
+}
+
+func capturePanic(fn func()) (value any) {
+	defer func() {
+		value = recover()
+	}()
+	fn()
+
+	return nil
 }
 
 func TestRelayProcessOnce(t *testing.T) {
@@ -225,16 +265,229 @@ func TestRelayFailureHandlerNotCalledOnContextCancel(t *testing.T) {
 	}
 }
 
+func TestRelayHandlerPanicBecomesFailureAndProcessingContinues(t *testing.T) {
+	const secret = "panic-secret-sentinel"
+
+	batch := &fakeBatch{records: []Record{{ID: ID{1}}, {ID: ID{2}}}}
+	logger := &captureLogger{}
+	var callbackErr error
+	relay := NewRelay(
+		staticConsumer{batch: batch},
+		HandlerFunc(func(_ context.Context, record Record) error {
+			if record.ID == (ID{1}) {
+				panic(secret)
+			}
+
+			return nil
+		}),
+		WithErrorHandler(func(_ context.Context, _ Record, err error) {
+			callbackErr = err
+		}),
+		WithLogger(logger),
+	)
+
+	var (
+		processed bool
+		err       error
+	)
+	panicValue := capturePanic(func() {
+		processed, err = relay.ProcessOnce(context.Background())
+	})
+	if panicValue != nil {
+		t.Fatalf("ProcessOnce panic = %v, want nil", panicValue)
+	}
+	if err != nil {
+		t.Fatalf("ProcessOnce error = %v", err)
+	}
+	if !processed {
+		t.Fatal("expected batch to be processed")
+	}
+	if callbackErr == nil || callbackErr.Error() != "outbox handler panicked" {
+		t.Fatalf("callback error = %v, want safe panic summary", callbackErr)
+	}
+	if len(batch.failures) != 1 {
+		t.Fatalf("failures = %d, want 1", len(batch.failures))
+	}
+	if got := batch.failures[0].Err.Error(); got != "outbox handler panicked" {
+		t.Fatalf("persisted failure = %q, want safe panic summary", got)
+	}
+	if strings.Contains(batch.failures[0].Err.Error(), secret) {
+		t.Fatal("persisted failure contains panic payload")
+	}
+	if logs := strings.Join(logger.entries, "\n"); strings.Contains(logs, secret) {
+		t.Fatal("logs contain panic payload")
+	}
+	if len(batch.ackIDs) != 1 || batch.ackIDs[0] != (ID{2}) {
+		t.Fatalf("ack IDs = %v, want later record", batch.ackIDs)
+	}
+	if !batch.committed || batch.rolled {
+		t.Fatalf("committed = %t, rolled back = %t", batch.committed, batch.rolled)
+	}
+}
+
+func TestRelayHandlerErrorPersistenceIsSecretSafe(t *testing.T) {
+	const secret = "error-secret-sentinel"
+
+	sourceErr := fmt.Errorf("publish failed with %s", secret)
+	batch := &fakeBatch{records: []Record{{ID: ID{1}}}}
+	var (
+		handlerErr    error
+		classifierErr error
+	)
+	relay := NewRelay(
+		staticConsumer{},
+		HandlerFunc(func(context.Context, Record) error {
+			return sourceErr
+		}),
+		WithErrorHandler(func(_ context.Context, _ Record, err error) {
+			handlerErr = err
+		}),
+		WithFailureClassifier(func(_ context.Context, _ Record, err error) FailureAction {
+			classifierErr = err
+
+			return FailureRetry
+		}),
+	)
+
+	if err := relay.processBatch(context.Background(), batch); err != nil {
+		t.Fatalf("process batch: %v", err)
+	}
+	if !errors.Is(handlerErr, sourceErr) {
+		t.Fatalf("failure handler error = %v, want original error", handlerErr)
+	}
+	if !errors.Is(classifierErr, sourceErr) {
+		t.Fatalf("classifier error = %v, want original error", classifierErr)
+	}
+	if len(batch.failures) != 1 {
+		t.Fatalf("failures = %d, want 1", len(batch.failures))
+	}
+	if got := batch.failures[0].Err.Error(); got != "outbox handler failed" {
+		t.Fatalf("persisted failure = %q, want safe error summary", got)
+	}
+	if strings.Contains(batch.failures[0].Err.Error(), secret) {
+		t.Fatal("persisted failure contains handler error details")
+	}
+}
+
+func TestRelayUnexpectedPanicRollsBackWithoutLeakingPayload(t *testing.T) {
+	const secret = "callback-panic-secret-sentinel"
+
+	batch := &fakeBatch{records: []Record{{ID: ID{1}}}}
+	logger := &captureLogger{}
+	relay := NewRelay(
+		staticConsumer{batch: batch},
+		HandlerFunc(func(context.Context, Record) error {
+			return errors.New("handler failed")
+		}),
+		WithFailureClassifier(func(context.Context, Record, error) FailureAction {
+			panic(secret)
+		}),
+		WithLogger(logger),
+	)
+
+	err := relay.Run(context.Background())
+	if !errors.Is(err, ErrWorkerPanic) {
+		t.Fatalf("Run error = %v, want ErrWorkerPanic", err)
+	}
+	if err.Error() != ErrWorkerPanic.Error() {
+		t.Fatalf("Run error = %q, want generic worker panic", err)
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatal("Run error contains panic payload")
+	}
+	if !batch.rolled || batch.committed {
+		t.Fatalf("rolled back = %t, committed = %t", batch.rolled, batch.committed)
+	}
+	if batch.rollCalls != 1 {
+		t.Fatalf("rollback calls = %d, want 1", batch.rollCalls)
+	}
+	logs := strings.Join(logger.entries, "\n")
+	if !strings.Contains(logs, "outbox worker panic") {
+		t.Fatalf("logs = %q, want generic worker panic entry", logs)
+	}
+	if strings.Contains(logs, secret) {
+		t.Fatal("logs contain panic payload")
+	}
+}
+
+func TestRelayHandlerTimeoutIsCooperativeAndSecretSafe(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const secret = "timeout-secret-sentinel"
+
+		batch := &fakeBatch{records: []Record{{ID: ID{1}}}}
+		handlerStarted := make(chan struct{})
+		timeoutObserved := make(chan error)
+		releaseHandler := make(chan struct{})
+		defer close(releaseHandler)
+		done := make(chan error, 1)
+		relay := NewRelay(
+			staticConsumer{},
+			HandlerFunc(func(ctx context.Context, _ Record) error {
+				close(handlerStarted)
+				<-ctx.Done()
+				timeoutObserved <- ctx.Err()
+				<-releaseHandler
+
+				return fmt.Errorf("request failed with %s: %w", secret, ctx.Err())
+			}),
+			WithHandlerTimeout(time.Second),
+		)
+
+		go func() {
+			done <- relay.processBatch(t.Context(), batch)
+		}()
+
+		<-handlerStarted
+		if err := <-timeoutObserved; !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("handler context error = %v, want deadline exceeded", err)
+		}
+		synctest.Wait()
+		select {
+		case err := <-done:
+			t.Fatalf("process batch returned before handler: %v", err)
+		default:
+		}
+
+		releaseHandler <- struct{}{}
+		synctest.Wait()
+		if err := <-done; err != nil {
+			t.Fatalf("process batch: %v", err)
+		}
+		if len(batch.failures) != 1 {
+			t.Fatalf("failures = %d, want 1", len(batch.failures))
+		}
+		if got := batch.failures[0].Err.Error(); got != "outbox handler timed out" {
+			t.Fatalf("persisted failure = %q, want safe timeout summary", got)
+		}
+		if strings.Contains(batch.failures[0].Err.Error(), secret) {
+			t.Fatal("persisted failure contains timeout error details")
+		}
+		if !batch.committed || batch.rolled {
+			t.Fatalf("committed = %t, rolled back = %t", batch.committed, batch.rolled)
+		}
+	})
+}
+
 func TestRelayProcessBatchAckErrorRollback(t *testing.T) {
-	batch := &fakeBatch{records: []Record{{ID: ID{1}}}, ackErr: errors.New("ack fail")}
+	batch := &fakeBatch{
+		records: []Record{{ID: ID{1}}},
+		ackErr:  errors.New("ack fail"),
+		rollErr: errors.New("rollback fail"),
+	}
 	relay := NewRelay(staticConsumer{}, HandlerFunc(func(context.Context, Record) error { return nil }))
 
 	err := relay.processBatch(context.Background(), batch)
 	if err == nil || !errors.Is(err, batch.ackErr) {
 		t.Fatalf("expected ack error, got %v", err)
 	}
+	if !errors.Is(err, batch.rollErr) {
+		t.Fatalf("expected rollback error, got %v", err)
+	}
 	if !batch.rolled {
 		t.Fatalf("expected rollback on ack error")
+	}
+	if batch.rollCalls != 1 {
+		t.Fatalf("rollback calls = %d, want 1", batch.rollCalls)
 	}
 	if batch.committed {
 		t.Fatalf("expected no commit on ack error")
@@ -290,6 +543,9 @@ func TestRelayProcessBatchDeadClassifier(t *testing.T) {
 	}
 	if len(batch.dead) != 1 {
 		t.Fatalf("expected 1 dead failure, got %d", len(batch.dead))
+	}
+	if got := batch.dead[0].Err.Error(); got != "outbox handler failed" {
+		t.Fatalf("dead failure = %q, want safe error summary", got)
 	}
 	if len(batch.failures) != 0 {
 		t.Fatalf("expected no retry failures, got %d", len(batch.failures))
@@ -437,11 +693,13 @@ func TestRelayProcessBatchNil(t *testing.T) {
 	}
 }
 
-func TestRelayPartitionWindowApplied(t *testing.T) {
-	now := time.Date(2025, 3, 1, 10, 0, 0, 0, time.UTC)
-	window := 2 * time.Hour
+func TestRelayPartitionWindowDoesNotFilterPending(t *testing.T) {
 	consumer := &captureConsumer{}
-	relay := NewRelay(consumer, HandlerFunc(func(context.Context, Record) error { return nil }), WithClock(fixedClock{now: now}), WithPartitionWindow(window))
+	relay := NewRelay(
+		consumer,
+		HandlerFunc(func(context.Context, Record) error { return nil }),
+		WithPartitionWindow(2*time.Hour),
+	)
 
 	ok, err := relay.ProcessOnce(context.Background())
 	if err != nil {
@@ -450,9 +708,8 @@ func TestRelayPartitionWindowApplied(t *testing.T) {
 	if ok {
 		t.Fatalf("expected no batch")
 	}
-	expected := now.Add(-window)
-	if !consumer.opts.MinCreatedAt.Equal(expected) {
-		t.Fatalf("expected MinCreatedAt %v, got %v", expected, consumer.opts.MinCreatedAt)
+	if !consumer.opts.MinCreatedAt.IsZero() {
+		t.Fatalf("MinCreatedAt = %v, want zero", consumer.opts.MinCreatedAt)
 	}
 }
 

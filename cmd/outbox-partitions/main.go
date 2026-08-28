@@ -21,7 +21,10 @@ import (
 	"github.com/velmie/outbox/mysql"
 )
 
-const exitUsage = 2
+const (
+	dsnEnvName = "OUTBOX_DSN"
+	exitUsage  = 2
+)
 
 var errInvalidPeriod = errors.New("outbox partitions: invalid period")
 
@@ -79,19 +82,20 @@ func main() {
 		verbose    bool
 	)
 
-	flag.StringVar(&dsn, "dsn", "", "MySQL DSN, e.g. user:pass@tcp(host:3306)/db?parseTime=true")
+	flag.StringVar(&dsn, "dsn", "", "Deprecated: set OUTBOX_DSN")
 	flag.StringVar(&table, "table", "outbox", "Outbox table name")
 	flag.StringVar(&period, "period", "day", "Partition period: day or month")
 	flag.DurationVar(&lookahead, "lookahead", 0, "How far ahead to create partitions (e.g. 720h)")
 	flag.DurationVar(&checkEvery, "check-every", time.Hour, "How often to check for missing partitions")
 	flag.StringVar(&lockName, "lock-name", "", "Advisory lock name (optional)")
-	flag.DurationVar(&retention, "retention", 0, "Drop partitions older than this duration (optional)")
+	flag.DurationVar(&retention, "retention", 0, "Drop terminal-only partitions older than this duration (optional)")
 	flag.BoolVar(&once, "once", false, "Run once and exit")
 	flag.BoolVar(&verbose, "verbose", false, "Enable debug logging")
 	flag.Parse()
+	dsn = resolveDSN(dsn)
 
 	if dsn == "" {
-		fmt.Fprintln(os.Stderr, "dsn is required")
+		fmt.Fprintln(os.Stderr, "OUTBOX_DSN or -dsn is required")
 		flag.Usage()
 		os.Exit(exitUsage)
 	}
@@ -153,6 +157,14 @@ func run(
 	}
 
 	return nil
+}
+
+func resolveDSN(flagValue string) string {
+	if flagValue != "" {
+		return flagValue
+	}
+
+	return os.Getenv(dsnEnvName)
 }
 
 func parsePeriod(value string) (mysql.PartitionPeriod, error) {

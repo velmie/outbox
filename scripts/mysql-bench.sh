@@ -5,8 +5,9 @@ NAME="${NAME:-outbox-mysql-bench}"
 PORT="${PORT:-3307}"
 DATA_SIZE="${DATA_SIZE:-8g}"
 DATA_DIR="${DATA_DIR:-/tmp/outbox-mysql-bench-data}"
-ROOT_PASSWORD="${ROOT_PASSWORD:-secret}"
+ROOT_PASSWORD="${ROOT_PASSWORD:-}"
 DATABASE="${DATABASE:-outbox}"
+MYSQL_IMAGE="${MYSQL_IMAGE:-mysql:8.4.11@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb}"
 PROFILE="${PROFILE:-fast}"
 FAST="${FAST:-}"
 USE_TMPFS="${USE_TMPFS:-}"
@@ -14,6 +15,11 @@ REMOVE_CONTAINER="${REMOVE_CONTAINER:-1}"
 BINLOG="${BINLOG:-}"
 BINLOG_EXPIRE_SECONDS="${BINLOG_EXPIRE_SECONDS:-}"
 BINLOG_MAX_SIZE="${BINLOG_MAX_SIZE:-}"
+
+if [[ -z "${ROOT_PASSWORD}" ]]; then
+  echo "ROOT_PASSWORD is required." >&2
+  exit 1
+fi
 
 if [[ -z "${FAST}" ]]; then
   if [[ "${PROFILE}" == "prod" ]]; then
@@ -63,9 +69,9 @@ fi
 DOCKER_ARGS=(
   -d
   --name "${NAME}"
-  --network host
-  -e "MYSQL_ROOT_PASSWORD=${ROOT_PASSWORD}"
-  -e "MYSQL_DATABASE=${DATABASE}"
+  --publish "127.0.0.1:${PORT}:${PORT}"
+  --env MYSQL_ROOT_PASSWORD
+  --env MYSQL_DATABASE
 )
 
 if [[ "${REMOVE_CONTAINER}" == "1" ]]; then
@@ -99,6 +105,7 @@ else
   MYSQL_ARGS+=(--skip-log-bin)
 fi
 
-docker run "${DOCKER_ARGS[@]}" mysql:8.0.36 "${MYSQL_ARGS[@]}"
+MYSQL_ROOT_PASSWORD="${ROOT_PASSWORD}" MYSQL_DATABASE="${DATABASE}" \
+  docker run "${DOCKER_ARGS[@]}" "${MYSQL_IMAGE}" "${MYSQL_ARGS[@]}"
 
 echo "MySQL started on host port ${PORT} (db=${DATABASE})."

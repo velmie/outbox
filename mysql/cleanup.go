@@ -3,6 +3,7 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -43,7 +44,7 @@ type CleanupMaintainerConfig struct {
 	Limit int
 	// IncludeDead removes dead rows in addition to processed rows.
 	IncludeDead bool
-	// LockName is the advisory lock name. Defaults to outbox:cleanup:<table>.
+	// LockName is the 1-to-64-character advisory lock name. Defaults to outbox:cleanup:<table>.
 	LockName string
 	// Clock overrides time source (useful for tests).
 	Clock outbox.Clock
@@ -59,33 +60,7 @@ type CleanupMaintainer struct {
 
 // Cleanup removes processed rows (and optionally dead rows) older than opts.Before.
 func (s *Store) Cleanup(ctx context.Context, opts CleanupOptions) (CleanupResult, error) {
-	if opts.Before.IsZero() {
-		return CleanupResult{}, ErrCleanupBeforeRequired
-	}
-	limit := opts.Limit
-	if limit == 0 {
-		limit = defaultCleanupLimit
-	}
-	if limit < 0 {
-		return CleanupResult{}, ErrCleanupLimitInvalid
-	}
-
-	remaining := limit
-	processed, err := s.cleanupByStatus(ctx, outbox.StatusProcessed, "processed_at", opts.Before, remaining)
-	if err != nil {
-		return CleanupResult{}, err
-	}
-	remaining -= int(processed)
-
-	var dead int64
-	if opts.IncludeDead && remaining > 0 {
-		dead, err = s.cleanupByStatus(ctx, outbox.StatusDead, "updated_at", opts.Before, remaining)
-		if err != nil {
-			return CleanupResult{}, err
-		}
-	}
-
-	return CleanupResult{Processed: processed, Dead: dead}, nil
+	return s.cleanup(ctx, s.db, opts)
 }
 
 // NewCleanupMaintainer creates a new cleanup maintainer with defaults applied.
@@ -120,6 +95,9 @@ func NewCleanupMaintainer(db *sql.DB, cfg CleanupMaintainerConfig) (*CleanupMain
 	if cfg.LockName == "" {
 		cfg.LockName = defaultCleanupLockPrefix + cfg.Table
 	}
+	if err := validateNamedLockName(cfg.LockName); err != nil {
+		return nil, err
+	}
 
 	return &CleanupMaintainer{store: store, cfg: cfg}, nil
 }
@@ -146,14 +124,14 @@ func (m *CleanupMaintainer) Run(ctx context.Context) error {
 }
 
 // Ensure executes a single cleanup pass.
-func (m *CleanupMaintainer) Ensure(ctx context.Context) (CleanupResult, error) {
+func (m *CleanupMaintainer) Ensure(ctx context.Context) (result CleanupResult, err error) {
 	conn, err := m.store.db.Conn(ctx)
 	if err != nil {
 		return CleanupResult{}, fmt.Errorf("outbox mysql: cleanup conn failed: %w", err)
 	}
 	defer conn.Close()
 
-	locked, err := m.tryLock(ctx, conn)
+	locked, err := tryNamedLock(ctx, conn, m.cfg.LockName)
 	if err != nil {
 		return CleanupResult{}, err
 	}
@@ -162,18 +140,57 @@ func (m *CleanupMaintainer) Ensure(ctx context.Context) (CleanupResult, error) {
 
 		return CleanupResult{}, nil
 	}
-	defer m.releaseLock(ctx, conn)
+	defer func() {
+		err = errors.Join(err, releaseNamedLock(ctx, conn, m.cfg.LockName))
+	}()
 
 	before := m.cfg.Clock.Now().Add(-m.cfg.Retention)
 
-	return m.store.Cleanup(ctx, CleanupOptions{
+	return m.store.cleanup(ctx, conn, CleanupOptions{
 		Before:      before,
 		Limit:       m.cfg.Limit,
 		IncludeDead: m.cfg.IncludeDead,
 	})
 }
 
-func (s *Store) cleanupByStatus(ctx context.Context, status outbox.Status, tsColumn string, before time.Time, limit int) (int64, error) {
+func (s *Store) cleanup(ctx context.Context, exec Executor, opts CleanupOptions) (CleanupResult, error) {
+	if opts.Before.IsZero() {
+		return CleanupResult{}, ErrCleanupBeforeRequired
+	}
+	limit := opts.Limit
+	if limit == 0 {
+		limit = defaultCleanupLimit
+	}
+	if limit < 0 {
+		return CleanupResult{}, ErrCleanupLimitInvalid
+	}
+
+	remaining := limit
+	processed, err := s.cleanupByStatus(ctx, exec, outbox.StatusProcessed, "processed_at", opts.Before, remaining)
+	if err != nil {
+		return CleanupResult{}, err
+	}
+	remaining -= int(processed)
+
+	var dead int64
+	if opts.IncludeDead && remaining > 0 {
+		dead, err = s.cleanupByStatus(ctx, exec, outbox.StatusDead, "updated_at", opts.Before, remaining)
+		if err != nil {
+			return CleanupResult{}, err
+		}
+	}
+
+	return CleanupResult{Processed: processed, Dead: dead}, nil
+}
+
+func (s *Store) cleanupByStatus(
+	ctx context.Context,
+	exec Executor,
+	status outbox.Status,
+	tsColumn string,
+	before time.Time,
+	limit int,
+) (int64, error) {
 	if limit <= 0 {
 		return 0, nil
 	}
@@ -185,7 +202,7 @@ func (s *Store) cleanupByStatus(ctx context.Context, status outbox.Status, tsCol
 		tsColumn,
 		tsColumn,
 	)
-	res, err := s.db.ExecContext(ctx, query, status, before, limit)
+	res, err := exec.ExecContext(ctx, query, status, before, limit)
 	if err != nil {
 		return 0, fmt.Errorf("outbox mysql: cleanup delete failed: %w", err)
 	}
@@ -195,23 +212,4 @@ func (s *Store) cleanupByStatus(ctx context.Context, status outbox.Status, tsCol
 	}
 
 	return affected, nil
-}
-
-func (m *CleanupMaintainer) tryLock(ctx context.Context, conn *sql.Conn) (bool, error) {
-	var got sql.NullInt64
-	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, 0)", m.cfg.LockName).Scan(&got); err != nil {
-		return false, fmt.Errorf("outbox mysql: acquire cleanup lock failed: %w", err)
-	}
-	if !got.Valid || got.Int64 == 0 {
-		return false, nil
-	}
-
-	return true, nil
-}
-
-func (m *CleanupMaintainer) releaseLock(ctx context.Context, conn *sql.Conn) {
-	var released sql.NullInt64
-	if err := conn.QueryRowContext(ctx, "SELECT RELEASE_LOCK(?)", m.cfg.LockName).Scan(&released); err != nil {
-		m.cfg.Logger.Warn("outbox cleanup release lock failed", "err", err)
-	}
 }

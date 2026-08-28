@@ -7,7 +7,10 @@ import (
 
 // FetchOptions controls how pending records are selected.
 type FetchOptions struct {
-	BatchSize    int
+	BatchSize int
+	// MinCreatedAt is retained for source compatibility and is ignored.
+	//
+	// Deprecated: all pending records are eligible for delivery.
 	MinCreatedAt time.Time
 }
 
@@ -23,7 +26,8 @@ type Batch interface {
 	Records() []Record
 	// Ack marks the provided records as processed.
 	Ack(ctx context.Context, ids []ID) error
-	// Fail records failures and updates retry state for each record.
+	// Fail records failures and updates retry state for each record. Callers that
+	// construct Failure values directly must exclude secrets from Failure.Err.
 	Fail(ctx context.Context, failures []Failure) error
 	// Commit finalizes the batch transaction.
 	Commit() error

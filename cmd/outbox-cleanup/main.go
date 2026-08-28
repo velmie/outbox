@@ -21,7 +21,10 @@ import (
 	"github.com/velmie/outbox/mysql"
 )
 
-const exitUsage = 2
+const (
+	dsnEnvName = "OUTBOX_DSN"
+	exitUsage  = 2
+)
 
 type stdLogger struct {
 	logger  *log.Logger
@@ -77,9 +80,9 @@ func main() {
 		verbose     bool
 	)
 
-	flag.StringVar(&dsn, "dsn", "", "MySQL DSN, e.g. user:pass@tcp(host:3306)/db?parseTime=true")
+	flag.StringVar(&dsn, "dsn", "", "Deprecated: set OUTBOX_DSN")
 	flag.StringVar(&table, "table", "outbox", "Outbox table name")
-	flag.DurationVar(&retention, "retention", 0, "Delete rows older than this duration")
+	flag.DurationVar(&retention, "retention", 0, "Required positive duration; delete older rows")
 	flag.DurationVar(&checkEvery, "check-every", time.Hour, "How often to run cleanup")
 	flag.IntVar(&limit, "limit", 0, "Max rows deleted per run (0 uses default)")
 	flag.StringVar(&lockName, "lock-name", "", "Advisory lock name (optional)")
@@ -87,9 +90,10 @@ func main() {
 	flag.BoolVar(&once, "once", false, "Run once and exit")
 	flag.BoolVar(&verbose, "verbose", false, "Enable debug logging")
 	flag.Parse()
+	dsn = resolveDSN(dsn)
 
 	if dsn == "" {
-		fmt.Fprintln(os.Stderr, "dsn is required")
+		fmt.Fprintln(os.Stderr, "OUTBOX_DSN or -dsn is required")
 		flag.Usage()
 		os.Exit(exitUsage)
 	}
@@ -147,4 +151,12 @@ func run(
 	}
 
 	return nil
+}
+
+func resolveDSN(flagValue string) string {
+	if flagValue != "" {
+		return flagValue
+	}
+
+	return os.Getenv(dsnEnvName)
 }

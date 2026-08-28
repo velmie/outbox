@@ -120,3 +120,55 @@ func TestPlanPartitionChangesNameConflict(t *testing.T) {
 		t.Fatalf("expected ErrPartitionNameConflict, got %v", err)
 	}
 }
+
+func TestValidatePartitionLayout(t *testing.T) {
+	tests := []struct {
+		name           string
+		engine         string
+		method         string
+		expression     string
+		subpartitioned bool
+		want           bool
+	}{
+		{
+			name:       "canonical",
+			engine:     "InnoDB",
+			method:     "RANGE",
+			expression: "`created_ts`",
+			want:       true,
+		},
+		{
+			name:       "wrong engine",
+			engine:     "MyISAM",
+			method:     "RANGE",
+			expression: "`created_ts`",
+		},
+		{
+			name:       "range columns",
+			engine:     "InnoDB",
+			method:     "RANGE COLUMNS",
+			expression: "`created_ts`",
+		},
+		{
+			name:       "wrong expression",
+			engine:     "InnoDB",
+			method:     "RANGE",
+			expression: "`status`",
+		},
+		{
+			name:           "subpartitioned",
+			engine:         "InnoDB",
+			method:         "RANGE",
+			expression:     "`created_ts`",
+			subpartitioned: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := validPartitionLayout(tt.engine, tt.method, tt.expression, tt.subpartitioned); got != tt.want {
+				t.Fatalf("validPartitionLayout() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

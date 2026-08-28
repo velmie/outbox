@@ -11,8 +11,12 @@ The harness explores the core dimensions that affect throughput and latency:
 - Payload sizes (128B, 512B, 4KB).
 - Large payload penalty (16KB, 128KB).
 - Mixed workload (concurrent producers + consumers) with end-to-end latency.
-- Partition pruning impact (partitioned vs non-partitioned, partition window on/off).
+- Partitioned vs non-partitioned storage layout under time-distributed data.
 - Enqueue throughput with and without per-message transactions.
+
+> **Warning:** Every case launched by `scripts/benchmarks-run.sh` uses `-reset=true` and drops and recreates its table.
+> The default table is `outbox_bench`. When using an external MySQL instance, use a disposable, isolated database or
+> table and credentials scoped to it. Never point the harness at a production or shared outbox table.
 
 ## Quick run (3-5 minutes)
 
@@ -35,15 +39,16 @@ Full runs are longer and meant for final numbers.
 
 The harness assumes MySQL 8.0 and uses Docker + tmpfs by default:
 
-- `scripts/mysql-bench.sh` starts MySQL (pinned to `mysql:8.0.36`) with host networking and tmpfs for `/var/lib/mysql`.
+- `scripts/mysql-bench.sh` starts a digest-pinned MySQL 8.4.11 LTS container, publishes the selected port on loopback,
+  and uses tmpfs for `/var/lib/mysql`.
 - `scripts/mysql-bench-stop.sh` stops the container.
 
 You can skip the bundled MySQL and point to your own instance:
 
+Supply `OUTBOX_DSN` through the process environment or a secret manager before running the command.
+
 ```bash
-START_MYSQL=0 \
-DSN='user:pass@tcp(127.0.0.1:3306)/outbox?parseTime=true' \
-./scripts/benchmarks-run.sh
+START_MYSQL=0 ./scripts/benchmarks-run.sh
 ```
 
 ### Production-like profile
@@ -58,6 +63,13 @@ This switches to a disk-backed data directory and sets `innodb_flush_log_at_trx_
 and `sync_binlog=1`. The default data directory is `/tmp/outbox-mysql-bench-data`.
 Override it with `DATA_DIR=/path/to/data`.
 
+The runner selects this profile with `MYSQL_PROFILE`. When calling `scripts/mysql-bench.sh` directly, use `PROFILE`
+instead. The `fast` profile disables the binary log by default; if it is enabled, its expiration and maximum file size
+default to 600 seconds and 256M. The `prod` profile enables the binary log by default with 3600 seconds and 1G.
+
+With bundled MySQL, the runner defaults `PURGE_BINLOG=1` and makes a best-effort `RESET MASTER` after each completed
+benchmark run and again at phase transitions. This purge is disabled by default for external MySQL.
+
 ## Configuration knobs
 
 Environment variables for `scripts/benchmarks-run.sh`:
@@ -70,7 +82,7 @@ Environment variables for `scripts/benchmarks-run.sh`:
 - `PAYLOAD_SEED=1` (seed for payload generation)
 - `ENQUEUE_TIMEOUT=0s` (timeout per enqueue/transaction)
 - `MEASURE_LATENCY=1` (enable end-to-end latency collection in mixed mode)
-- `AUTO_TARGET=1` (auto-adjust consume target to visible rows; prevents hangs with narrow windows)
+- `AUTO_TARGET=1` (lower the consume target when the full pending backlog contains fewer rows than requested)
 - `CONSUME_RECORDS=200000`
 - `ENQUEUE_RECORDS=200000`
 - `MIXED=1` (enable mixed workload phase)
@@ -78,7 +90,7 @@ Environment variables for `scripts/benchmarks-run.sh`:
 - `MIXED_DURATION=0s` (set duration; overrides records in mixed mode)
 - `MIXED_PRODUCER_INTERVAL=0s` (rate-limit per producer)
 - `MIXED_DRAIN_TIMEOUT=2m`
-- `PARTITION_WINDOW=1h`
+- `PARTITION_WINDOW=0s` (deprecated compatibility input; accepted, recorded, and ignored)
 - `PARTITION_AHEAD=168h`
 - `PARTITION_LOOKBACK=0s` (create partitions in the past; useful for partition-effect runs)
 - `PARTITION_EFFECT_RECORDS=2000000`
@@ -86,10 +98,11 @@ Environment variables for `scripts/benchmarks-run.sh`:
 - `PARTITION_EFFECT_SEED_AGE=2160h`
 - `PARTITION_EFFECT_LOOKBACK=2160h` (defaults to seed age; ensures partitions cover seeded history)
 - `LARGE_PAYLOAD_RECORDS=20000` (reduced by default to avoid tmpfs exhaustion for 128KB payloads)
-- `DSN=...` and MySQL connection vars (`MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_DB`)
+- `OUTBOX_DSN` and MySQL connection vars (`MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_DB`)
 - `MYSQL_PROFILE=fast|prod` (defaults to `fast`; `prod` uses disk + higher durability)
-- `MYSQL_WAIT_SECONDS=180` (startup wait; default is 60 for fast, 180 for prod)
+- `MYSQL_WAIT_SECONDS` (startup wait; default is 60 for fast, 180 for prod)
 - `MYSQL_REMOVE_CONTAINER=1` (set to `0` to keep the MySQL container for debugging)
+- `PURGE_BINLOG=1|0` (defaults to `1` for bundled MySQL and `0` for external MySQL)
 
 The script embeds default grids:
 
@@ -114,7 +127,11 @@ Each JSON row also includes:
 
 - `processed` (actual records processed; throughput uses this value).
 - `reset_duration`, `seed_duration`, `run_duration` to separate setup from measured run time.
-- `partition_lookback` to capture the partition window used for the run.
+- `partition_lookback` to capture how far back the reset step created partitions.
+
+Tracked directories under `docs/benchmarks/results/` are immutable, revision-specific evidence. Older datasets may
+contain nonzero `partition_window` values produced when that input had different semantics. Keep those artifacts
+unchanged and do not combine them with current results without identifying the producing revision.
 
 The runner prints a progress line after each run with completed/total counts, per-phase progress, and ETA.
 
@@ -174,6 +191,8 @@ The script writes PNGs next to the summary file.
 ## Notes
 
 - The harness recreates the table for every run to keep results isolated.
-- Partition-effect runs seed records across multiple days using `-seed-age`/`-seed-days` to stress pruning.
-  Use `PARTITION_EFFECT_LOOKBACK` to ensure the partition ranges cover the seeded history.
+- The relay and auto-target calculation use the complete pending backlog; they do not apply a time-window cutoff.
+- Partition-effect runs seed records across multiple days using `-seed-age`/`-seed-days` to compare partitioned and
+  non-partitioned storage layouts under the same historical distribution. Use `PARTITION_EFFECT_LOOKBACK` to ensure
+  the partition ranges cover the seeded history.
 - `use_tx=false` is for raw insert baseline only; it is not recommended in production.

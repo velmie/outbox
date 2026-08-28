@@ -253,38 +253,24 @@ def save_mixed_latency_vs_throughput(df: pd.DataFrame, out_dir: str) -> None:
     fig.savefig(os.path.join(out_dir, filename), dpi=PLOT_STYLE["dpi"])
 
 
-def format_window(ns: float) -> str:
-    if pd.isna(ns):
-        return "unknown"
-    if ns == 0:
-        return "0s"
-    hour_ns = 3600 * 1_000_000_000
-    if ns % hour_ns == 0:
-        return f"{int(ns / hour_ns)}h"
-    return f"{ns:.0f}ns"
-
-
 def save_partition_effect(df: pd.DataFrame, out_dir: str) -> None:
     part = df[(df["phase"] == "partition") & (df["mode"] == "consume")]
-    title = "Partition effect (partitioned/window)"
+    title = "Partition effect (partitioned vs flat)"
     filename = "partition_effect.png"
     if part.empty:
         save_placeholder(out_dir, filename, title, "No partition data available.")
         return
 
     agg = (
-        part.groupby(["partitioned", "partition_window"], as_index=False)["throughput_msg_per_sec"]
+        part.groupby("partitioned", as_index=False)["throughput_msg_per_sec"]
         .mean()
         .dropna()
     )
     if len(agg) < 2:
-        save_placeholder(out_dir, filename, title, "Need >=2 scenarios to compare.")
+        save_placeholder(out_dir, filename, title, "Need both partitioned and flat scenarios to compare.")
         return
 
-    labels = [
-        f"partitioned={row.partitioned}, window={format_window(row.partition_window)}"
-        for row in agg.itertuples()
-    ]
+    labels = ["partitioned" if row.partitioned else "flat" for row in agg.itertuples()]
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.bar(labels, agg["throughput_msg_per_sec"], color="#4C78A8")
     ax.set_ylabel("throughput msg/s")
@@ -293,7 +279,7 @@ def save_partition_effect(df: pd.DataFrame, out_dir: str) -> None:
     ax.grid(True, axis="y", alpha=PLOT_STYLE["grid_alpha"])
     add_caption(
         ax,
-        "Flat table + time window scans history; partitioning enables pruning.",
+        "Both schemas poll all pending rows; this comparison measures table layout only.",
         loc="upper left",
     )
     fig.tight_layout()
