@@ -1,7 +1,7 @@
 # outbox
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/velmie/outbox.svg)](https://pkg.go.dev/github.com/velmie/outbox)
-[![Go Version](https://img.shields.io/badge/go-1.25%2B-00ADD8?logo=go)](go.mod)
+[![Go Version](https://img.shields.io/badge/go-1.26%2B-00ADD8?logo=go)](mysql/go.mod)
 [![License](https://img.shields.io/github/license/velmie/outbox)](LICENSE)
 
 `outbox` is a high-performance transactional outbox library. It ships with a MySQL 8.0+ backend optimized for polling
@@ -10,7 +10,7 @@ with
 
 ## Installation
 
-Requires Go 1.25+.
+The MySQL adapter and command modules require Go 1.26+. The root library alone supports Go 1.25+.
 
 ```bash
 go get github.com/velmie/outbox
@@ -108,6 +108,7 @@ func main() {
 3. Each record is handed to a handler and then marked `processed`, left `pending` for retry, or marked `dead`.
 
 The polling predicate considers the entire pending backlog; pending records do not become ineligible as they age.
+An opt-in durable retry delay temporarily excludes failed records until their stored deadline.
 Delivery is at least once: publication may succeed before the relay can acknowledge and commit the row, so handlers
 and downstream consumers must be idempotent. Publish `Record.ID` as the stable message identifier so downstream
 consumers can deduplicate retries.
@@ -121,6 +122,52 @@ consumers can deduplicate retries.
 
 - `Relay`: batch size 50, poll interval 50ms, workers 1.
 - `MySQL`: table `outbox`, max attempts 5, UUID v7 generator, JSON validation enabled.
+
+## Durable retry delay
+
+To share retry timing between processes, create a JSON outbox table with `mysql.RetrySchema("outbox")`
+and configure every consumer of that table with `mysql.WithRetryDelay(5*time.Second)`:
+
+```go
+store, err := mysql.NewStore(db,
+    mysql.WithTable("outbox"),
+    mysql.WithRetryDelay(5*time.Second),
+)
+```
+
+Apply the schema through a controlled migration before starting consumers. The option does not execute DDL.
+The existing schema helpers and stores without the option retain immediate retry eligibility and do not require
+the additional column. A zero delay disables scheduling; negative values are rejected. Positive durations round
+up to the next microsecond, matching MySQL's timestamp precision.
+
+With scheduling enabled, `Batch.Fail` writes `next_attempt_at` together with the attempt count, error, and status
+in the batch transaction. The deadline uses the database's UTC time when the failure update executes; time spent
+before the transaction commits counts toward the delay. Each consumer fetches only pending rows with no deadline
+or with a deadline at or before the database's current UTC time. Application clocks do not control eligibility.
+Other eligible rows can proceed while a failed row waits. Fetches order eligible records by ID; concurrent workers
+do not guarantee delivery completion order. Pending counts include delayed rows, and cleanup preserves them.
+The deadline is ignored once the row is processed or dead.
+
+The committed deadline survives process restarts. Rolling back the failure transaction rolls back both the attempt
+and deadline. If a process crashes before committing the failure, another process may retry sooner. Successful
+publication followed by a failed acknowledgement or commit can also repeat the same message; use its stable ID
+for downstream deduplication.
+
+For an existing table, apply the following migration before enabling scheduling (replace `outbox` with its
+configured table name):
+
+```sql
+ALTER TABLE outbox
+    ADD COLUMN next_attempt_at DATETIME(6) NULL,
+    ADD INDEX idx_status_next_attempt_id (status, next_attempt_at, id);
+```
+
+Existing rows have no deadline and remain eligible. Stop consumers that ignore deadlines before any consumer starts
+scheduling retries on that table, and configure every replacement consumer with a positive retry delay. A legacy
+consumer, including a new store with scheduling disabled, would fetch delayed rows immediately. Producers can
+continue using the existing enqueue contract. Missing scheduling schema causes a database error rather than a
+fallback to immediate retries. `RetrySchema` creates a non-partitioned JSON table; existing binary or partitioned
+tables can opt in through the explicit migration while retaining their payload and partition definitions.
 
 ## MySQL schema
 
@@ -628,6 +675,8 @@ Reproduce: [docs/benchmarks.md](docs/benchmarks.md).
 
 See [docs/guide.md](docs/guide.md) for architecture, tuning, failure handling, cleanup, and extension notes.
 See [docs/benchmarks.md](docs/benchmarks.md) for the research harness and plotting workflow.
+See [docs/migration-v0.3.0.md](docs/migration-v0.3.0.md) to upgrade from v0.2.0 and enable durable retry delay.
+See [docs/release-v0.3.0.md](docs/release-v0.3.0.md) for the v0.3.0 release notes.
 See [docs/migration-v0.2.0.md](docs/migration-v0.2.0.md) before upgrading from v0.1.1.
 See [docs/release-v0.2.0.md](docs/release-v0.2.0.md) for the v0.2.0 release notes.
 
@@ -664,7 +713,7 @@ done
 ```
 
 The complete gate requires Go 1.26.7, Git, tar, zip, Docker, golangci-lint 2.12.2, govulncheck 1.7.0, and Trivy 0.74.0.
-Run `./scripts/verify.sh` for the root, `mysql`, and `cmd` release gate. It verifies the future v0.2.0 module graph
+Run `./scripts/verify.sh` for the root, `mysql`, and `cmd` release gate. It verifies the v0.3.0 candidate module graph
 without `go.work`, then runs integration tests, `govulncheck`, and Trivy.
 
 ## License

@@ -9,4 +9,6 @@
 // See Schema/PartitionedSchema (JSON payloads) or SchemaBinary/PartitionedSchemaBinary (raw bytes),
 // PartitionMaintainer for partition rotation, and CleanupMaintainer for periodic row cleanup when
 // partitions are not used.
+// RetrySchema and WithRetryDelay enable shared database-clock retry deadlines.
+// Every consumer of a scheduling-enabled table must honor those deadlines.
 package mysql

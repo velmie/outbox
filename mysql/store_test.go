@@ -7,9 +7,34 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/velmie/outbox"
 )
+
+func TestStoreRetryDelayConfiguration(t *testing.T) {
+	tests := []struct {
+		name  string
+		delay time.Duration
+		err   error
+	}{
+		{name: "disabled"},
+		{name: "positive", delay: time.Second},
+		{name: "submicrosecond", delay: time.Nanosecond},
+		{name: "negative", delay: -time.Second, err: ErrRetryDelayInvalid},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store, err := NewStore(&sql.DB{}, WithRetryDelay(tt.delay))
+			if !errors.Is(err, tt.err) {
+				t.Fatalf("error = %v, want %v", err, tt.err)
+			}
+			if tt.err != nil && store != nil {
+				t.Fatal("invalid configuration returned a store")
+			}
+		})
+	}
+}
 
 type fakeResult struct{}
 
@@ -41,7 +66,7 @@ func TestStoreEnqueueGeneratesID(t *testing.T) {
 	gen := &fixedGenerator{id: validTestID(t, 1)}
 	store := &Store{
 		cfg:     Config{Generator: gen}.withDefaults(),
-		queries: newQueries("outbox"),
+		queries: newQueries("outbox", false),
 		table:   "outbox",
 	}
 	entry := outbox.Entry{
@@ -80,7 +105,7 @@ func TestStoreEnqueueSkipsPayloadValidation(t *testing.T) {
 			ValidateHeaders:    true,
 			validateHeadersSet: true,
 		}.withDefaults(),
-		queries: newQueries("outbox"),
+		queries: newQueries("outbox", false),
 		table:   "outbox",
 	}
 	entry := outbox.Entry{
@@ -116,7 +141,7 @@ func TestStoreEnqueueRejectsInvalidCallerIDsBeforePersistence(t *testing.T) {
 			gen := &fixedGenerator{id: valid}
 			store := &Store{
 				cfg:     Config{Generator: gen}.withDefaults(),
-				queries: newQueries("outbox"),
+				queries: newQueries("outbox", false),
 				table:   "outbox",
 			}
 			fakeExec := &fakeExecutor{}
@@ -158,7 +183,7 @@ func TestStoreEnqueueRejectsInvalidGeneratedIDsBeforePersistence(t *testing.T) {
 			gen := &fixedGenerator{id: test.id}
 			store := &Store{
 				cfg:     Config{Generator: gen}.withDefaults(),
-				queries: newQueries("outbox"),
+				queries: newQueries("outbox", false),
 				table:   "outbox",
 			}
 			fakeExec := &fakeExecutor{}

@@ -17,18 +17,18 @@ const (
 	placeholderGrowth = 2
 )
 
-// Executor allows enqueuing within an existing transaction.
-type Executor interface {
-	// ExecContext executes a statement with the provided context.
-	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
-}
-
 // Store implements a MySQL-backed outbox using polling + SKIP LOCKED.
 type Store struct {
 	db      *sql.DB
 	cfg     Config
 	queries queries
 	table   string
+}
+
+// Executor allows enqueuing within an existing transaction.
+type Executor interface {
+	// ExecContext executes a statement with the provided context.
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
 var _ outbox.Consumer = (*Store)(nil)
@@ -45,6 +45,9 @@ func NewStore(db *sql.DB, opts ...Option) (*Store, error) {
 		opt(&cfg)
 	}
 	cfg = cfg.withDefaults()
+	if cfg.RetryDelay < 0 {
+		return nil, ErrRetryDelayInvalid
+	}
 
 	table, err := sanitizeTableName(cfg.Table)
 	if err != nil {
@@ -54,7 +57,7 @@ func NewStore(db *sql.DB, opts ...Option) (*Store, error) {
 	return &Store{
 		db:      db,
 		cfg:     cfg,
-		queries: newQueries(table),
+		queries: newQueries(table, cfg.RetryDelay > 0),
 		table:   table,
 	}, nil
 }
@@ -116,7 +119,8 @@ func (s *Store) Enqueue(ctx context.Context, exec Executor, entry outbox.Entry) 
 	return id, nil
 }
 
-// Fetch locks and returns a batch of pending records using READ COMMITTED + SKIP LOCKED.
+// Fetch locks eligible pending records using READ COMMITTED + SKIP LOCKED.
+// When retry scheduling is enabled, future deadlines are excluded.
 func (s *Store) Fetch(ctx context.Context, opts outbox.FetchOptions) (outbox.Batch, error) {
 	if opts.BatchSize <= 0 {
 		return nil, outbox.ErrInvalidBatchSize
@@ -140,6 +144,16 @@ func (s *Store) Fetch(ctx context.Context, opts outbox.FetchOptions) (outbox.Bat
 	}
 
 	return &batch{tx: tx, store: s, records: records}, nil
+}
+
+// PendingCount returns the number of pending outbox rows, including delayed retries.
+func (s *Store) PendingCount(ctx context.Context) (int, error) {
+	var count int
+	if err := s.db.QueryRowContext(ctx, s.queries.countPending, outbox.StatusPending).Scan(&count); err != nil {
+		return 0, fmt.Errorf("outbox mysql: pending count failed: %w", err)
+	}
+
+	return count, nil
 }
 
 func (s *Store) selectBatch(ctx context.Context, tx *sql.Tx, opts outbox.FetchOptions) ([]outbox.Record, error) {
@@ -210,14 +224,16 @@ func (s *Store) fail(ctx context.Context, tx *sql.Tx, failures []outbox.Failure)
 
 	for _, failure := range failures {
 		errText := truncateError(failure.Err)
+		args := []any{errText, s.cfg.MaxAttempts, outbox.StatusDead, outbox.StatusPending}
+		if s.cfg.RetryDelay > 0 {
+			micros := int64((s.cfg.RetryDelay-1)/time.Microsecond) + 1
+			args = append(args, micros)
+		}
+		args = append(args, failure.ID)
 		if _, err := tx.ExecContext(
 			ctx,
 			s.queries.updateFailureOne,
-			errText,
-			s.cfg.MaxAttempts,
-			outbox.StatusDead,
-			outbox.StatusPending,
-			failure.ID,
+			args...,
 		); err != nil {
 			return fmt.Errorf("outbox mysql: fail update failed: %w", err)
 		}
@@ -245,16 +261,6 @@ func (s *Store) dead(ctx context.Context, tx *sql.Tx, failures []outbox.Failure)
 	}
 
 	return nil
-}
-
-// PendingCount returns the number of pending outbox rows.
-func (s *Store) PendingCount(ctx context.Context) (int, error) {
-	var count int
-	if err := s.db.QueryRowContext(ctx, s.queries.countPending, outbox.StatusPending).Scan(&count); err != nil {
-		return 0, fmt.Errorf("outbox mysql: pending count failed: %w", err)
-	}
-
-	return count, nil
 }
 
 func buildAckQuery(table string, count int) string {

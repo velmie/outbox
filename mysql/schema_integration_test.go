@@ -39,6 +39,7 @@ func TestSchemasUseInnoDBWhenSessionDefaultDiffers(t *testing.T) {
 		build func() (string, error)
 	}{
 		{name: "json", table: "schema_json", build: func() (string, error) { return mysql.Schema("schema_json") }},
+		{name: "retry json", table: "schema_retry", build: func() (string, error) { return mysql.RetrySchema("schema_retry") }},
 		{name: "binary", table: "schema_binary", build: func() (string, error) { return mysql.SchemaBinary("schema_binary") }},
 		{
 			name:  "partitioned json",

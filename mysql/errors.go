@@ -3,6 +3,8 @@ package mysql
 import "errors"
 
 var (
+	// ErrRetryDelayInvalid is returned when the retry delay is negative.
+	ErrRetryDelayInvalid = errors.New("outbox mysql: retry delay must be non-negative")
 	// ErrDBRequired is returned when a nil *sql.DB is provided.
 	ErrDBRequired = errors.New("outbox mysql: db is required")
 	// ErrExecutorRequired is returned when enqueue is called with a nil executor.

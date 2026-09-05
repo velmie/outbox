@@ -1,6 +1,10 @@
 package mysql
 
-import "github.com/velmie/outbox"
+import (
+	"time"
+
+	"github.com/velmie/outbox"
+)
 
 const (
 	defaultTable       = "outbox"
@@ -11,6 +15,7 @@ const (
 type Config struct {
 	Table              string
 	MaxAttempts        int
+	RetryDelay         time.Duration
 	Clock              outbox.Clock
 	Generator          outbox.IDGenerator
 	ValidateJSON       bool
@@ -19,35 +24,6 @@ type Config struct {
 	validatePayloadSet bool
 	ValidateHeaders    bool
 	validateHeadersSet bool
-}
-
-func (c Config) withDefaults() Config {
-	if c.Table == "" {
-		c.Table = defaultTable
-	}
-	if c.MaxAttempts <= 0 {
-		c.MaxAttempts = defaultMaxAttempts
-	}
-	if c.Clock == nil {
-		c.Clock = outbox.SystemClock{}
-	}
-	if c.Generator == nil {
-		c.Generator = outbox.NewUUIDv7Generator(c.Clock)
-	}
-	if !c.validateJSONSet {
-		c.ValidateJSON = true
-	}
-	if !c.validatePayloadSet {
-		c.ValidatePayload = c.ValidateJSON
-	}
-	if !c.validateHeadersSet {
-		c.ValidateHeaders = c.ValidateJSON
-	}
-	if !c.validateJSONSet {
-		c.ValidateJSON = c.ValidatePayload && c.ValidateHeaders
-	}
-
-	return c
 }
 
 // Option configures the MySQL store.
@@ -67,7 +43,19 @@ func WithMaxAttempts(attempts int) Option {
 	}
 }
 
-// WithClock sets the time source used by the store.
+// WithRetryDelay enables durable retry scheduling with a fixed delay.
+// The table must include the next_attempt_at column provided by RetrySchema.
+// Every consumer of a scheduled table must enable scheduling. Zero disables it;
+// negative values are invalid. Positive values round up to microsecond precision.
+// Deadlines use database UTC time at the failure update, independently of WithClock.
+func WithRetryDelay(delay time.Duration) Option {
+	return func(c *Config) {
+		c.RetryDelay = delay
+	}
+}
+
+// WithClock sets the time source used for IDs and acknowledgement timestamps.
+// Durable retry deadlines and eligibility always use the database clock.
 func WithClock(clock outbox.Clock) Option {
 	return func(c *Config) {
 		c.Clock = clock
@@ -107,4 +95,33 @@ func WithValidateHeaders(enabled bool) Option {
 		c.ValidateHeaders = enabled
 		c.validateHeadersSet = true
 	}
+}
+
+func (c Config) withDefaults() Config {
+	if c.Table == "" {
+		c.Table = defaultTable
+	}
+	if c.MaxAttempts <= 0 {
+		c.MaxAttempts = defaultMaxAttempts
+	}
+	if c.Clock == nil {
+		c.Clock = outbox.SystemClock{}
+	}
+	if c.Generator == nil {
+		c.Generator = outbox.NewUUIDv7Generator(c.Clock)
+	}
+	if !c.validateJSONSet {
+		c.ValidateJSON = true
+	}
+	if !c.validatePayloadSet {
+		c.ValidatePayload = c.ValidateJSON
+	}
+	if !c.validateHeadersSet {
+		c.ValidateHeaders = c.ValidateJSON
+	}
+	if !c.validateJSONSet {
+		c.ValidateJSON = c.ValidatePayload && c.ValidateHeaders
+	}
+
+	return c
 }

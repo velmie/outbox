@@ -1,9 +1,10 @@
 # outbox guide
 
-This guide covers the root library and MySQL adapter for production use. All repository modules require Go 1.25+;
-the MySQL adapter requires MySQL 8.0+.
+This guide covers the root library and MySQL adapter for production use. The MySQL adapter and commands require
+Go 1.26+; the root library alone supports Go 1.25+. The MySQL adapter requires MySQL 8.0+.
 
 For the v0.1.1 to v0.2.0 transition, follow [the migration guide](migration-v0.2.0.md).
+For v0.3.0 and optional durable retry scheduling, follow [the v0.3.0 migration guide](migration-v0.3.0.md).
 
 ## Goals
 
@@ -93,7 +94,7 @@ Useful options:
 
 ### Polling query
 
-The adapter uses a single optimized query:
+Without retry scheduling, the adapter uses this query:
 
 ```sql
 SELECT id, aggregate_type, aggregate_id, event_type, payload, headers, created_at, attempt_count
@@ -110,6 +111,10 @@ Key properties:
 - `ORDER BY id` benefits from UUID v7 ordering.
 - `LIMIT` keeps transactions short.
 - The predicate considers the entire pending backlog; pending rows remain eligible regardless of UUID timestamp.
+
+With `mysql.WithRetryDelay` set to a positive duration, the predicate also requires
+`next_attempt_at IS NULL OR next_attempt_at <= UTC_TIMESTAMP(6)`. This temporarily excludes delayed retries while
+keeping the same ID ordering and locking behavior. Pending counts include delayed rows.
 
 ### Enqueue semantics
 
@@ -143,6 +148,15 @@ Each `Fail` call:
 - sets `last_error` (truncated to 1024 chars). Relay-created failures use only `outbox handler failed`,
   `outbox handler panicked`, or `outbox handler timed out`; direct `Batch.Fail` callers own the safety of supplied errors.
 - keeps `status = pending` until `attempt_count` reaches `MaxAttempts`, then sets `status = dead`
+
+With `mysql.WithRetryDelay` enabled, `Fail` also writes a database-clock deadline to `next_attempt_at` in the same
+transaction. A commit makes both the attempt and deadline durable; a rollback restores both. The delay starts
+at the failure update, so a slow commit can consume part or all of it. New entries have a null deadline and are
+immediately eligible. Processed and dead rows remain terminal regardless of any stored deadline.
+
+The default delay is zero, which preserves immediate retry eligibility on the original schema. A positive delay
+requires the scheduling schema and consumers that all honor deadlines. See the
+[activation and rollback procedure](migration-v0.3.0.md) before enabling it on an existing table.
 
 `Relay` can classify failures with `FailureClassifier`. When it returns:
 - `FailureRetry`: `Fail` is called and attempts are incremented.

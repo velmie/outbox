@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="v0.2.0"
+VERSION="v0.3.0"
 
 for command in go git tar zip; do
   if ! command -v "${command}" >/dev/null 2>&1; then
@@ -15,6 +15,10 @@ if [[ "$(GOWORK=off GOTOOLCHAIN=go1.26.7 go env GOVERSION)" != "go1.26.7" ]]; th
   echo "release module check requires Go 1.26.7" >&2
   exit 1
 fi
+
+# Use the selected toolchain before switching to the isolated module cache and
+# file-only proxy, which contains release modules but no toolchain downloads.
+export PATH="$(GOWORK=off GOTOOLCHAIN=go1.26.7 go env GOROOT)/bin:${PATH}"
 
 tmp_dir="$(mktemp -d)"
 cleanup() {

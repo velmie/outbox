@@ -12,6 +12,7 @@ func TestSchemasDeclareInnoDB(t *testing.T) {
 		build func() (string, error)
 	}{
 		{name: "json", build: func() (string, error) { return Schema("outbox") }},
+		{name: "retry json", build: func() (string, error) { return RetrySchema("outbox") }},
 		{name: "binary", build: func() (string, error) { return SchemaBinary("outbox") }},
 		{
 			name: "partitioned json",
