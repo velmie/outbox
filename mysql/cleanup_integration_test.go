@@ -6,9 +6,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 
 	"github.com/velmie/outbox"
@@ -113,6 +115,50 @@ func TestStoreCleanupLimitIntegration(t *testing.T) {
 	require.NoError(t, err)
 	require.EqualValues(t, 2, res.Processed)
 	require.Equal(t, 0, countByStatus(t, ctx, db, outbox.StatusProcessed))
+}
+
+func TestStoreCleanupPartialResultIntegration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test disabled in short mode")
+	}
+	ctx := context.Background()
+	container, db := startMySQLContainer(t, ctx)
+	t.Cleanup(func() { _ = db.Close(); _ = container.Terminate(ctx) })
+	setupSchema(t, ctx, db)
+	store, err := mysql.NewStore(db)
+	require.NoError(t, err)
+	insertEntries(t, ctx, db, store, []outbox.Entry{
+		{AggregateType: "order", AggregateID: "1", EventType: "created", Payload: json.RawMessage(`{}`)},
+		{AggregateType: "order", AggregateID: "2", EventType: "created", Payload: json.RawMessage(`{}`)},
+	})
+	records, err := fetchAllRecords(ctx, db)
+	require.NoError(t, err)
+	require.Len(t, records, 2)
+	old := time.Now().UTC().Add(-2 * time.Hour)
+	setStatus(t, ctx, db, records[0], outbox.StatusProcessed, &old, &old)
+	setStatus(t, ctx, db, records[1], outbox.StatusDead, nil, &old)
+	_, err = db.ExecContext(ctx, fmt.Sprintf(`CREATE TRIGGER reject_dead_cleanup BEFORE DELETE ON outbox
+ FOR EACH ROW BEGIN
+  IF OLD.status = %d THEN
+   SIGNAL SQLSTATE '45000' SET MYSQL_ERRNO = 1644, MESSAGE_TEXT = 'dead cleanup rejected';
+  END IF;
+ END`, outbox.StatusDead))
+	require.NoError(t, err)
+	// Reserve another session before Cleanup so the verification cannot reuse its connection.
+	observer, err := db.Conn(ctx)
+	require.NoError(t, err)
+	defer observer.Close()
+	result, cleanupErr := store.Cleanup(ctx, mysql.CleanupOptions{Before: time.Now().UTC().Add(-time.Hour), Limit: 10, IncludeDead: true})
+	var driverErr *mysqldriver.MySQLError
+	require.ErrorAs(t, cleanupErr, &driverErr)
+	require.EqualValues(t, 1644, driverErr.Number)
+	require.Equal(t, [5]byte{'4', '5', '0', '0', '0'}, driverErr.SQLState)
+	var processed, dead int
+	require.NoError(t, observer.QueryRowContext(ctx, "SELECT COUNT(*) FROM outbox WHERE id = ?", records[0]).Scan(&processed))
+	require.NoError(t, observer.QueryRowContext(ctx, "SELECT COUNT(*) FROM outbox WHERE id = ? AND status = ?", records[1], outbox.StatusDead).Scan(&dead))
+	require.Zero(t, processed)
+	require.Equal(t, 1, dead)
+	require.Equal(t, mysql.CleanupResult{Processed: 1}, result)
 }
 
 func fetchAllRecords(ctx context.Context, db *sql.DB) ([]outbox.ID, error) {

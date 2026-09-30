@@ -51,7 +51,7 @@ type PartitionMaintainerConfig struct {
 	Retention time.Duration
 	// Clock overrides time source (useful for tests).
 	Clock outbox.Clock
-	// Logger receives warnings about maintenance failures.
+	// Logger receives structured partition maintenance diagnostics.
 	Logger outbox.Logger
 }
 
@@ -126,71 +126,105 @@ func (m *PartitionMaintainer) Run(ctx context.Context) error {
 	ticker := time.NewTicker(m.cfg.CheckEvery)
 	defer ticker.Stop()
 
-	if err := m.Ensure(ctx); err != nil {
-		m.cfg.Logger.Warn("outbox partitions ensure failed", "err", err)
-	}
+	_ = m.Ensure(ctx)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if err := m.Ensure(ctx); err != nil {
-				m.cfg.Logger.Warn("outbox partitions ensure failed", "err", err)
-			}
+			_ = m.Ensure(ctx)
 		}
 	}
 }
 
 // Ensure creates missing partitions ahead of time and optionally drops old ones.
 func (m *PartitionMaintainer) Ensure(ctx context.Context) (err error) {
+	stage := maintenanceStageConnect
+	skipped := false
+	completed := false
+	defer func() {
+		switch {
+		case err != nil:
+			m.cfg.Logger.Warn("outbox partitions failed",
+				"event", "partitions.failed", "operation", "partitions.ensure", "outcome", "failed", "stage", stage, "err", err,
+			)
+		case skipped:
+			m.cfg.Logger.Debug("outbox partitions lock held by another session",
+				"event", "partitions.skipped", "operation", "partitions.ensure", "outcome", "skipped", "reason", "lock_busy",
+			)
+		case completed:
+			m.cfg.Logger.Debug("outbox partitions completed",
+				"event", "partitions.completed", "operation", "partitions.ensure", "outcome", "succeeded",
+			)
+		}
+	}()
+
 	conn, err := m.db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("outbox mysql: partition conn failed: %w", err)
 	}
 	defer conn.Close()
 
+	stage = maintenanceStageAcquireLock
 	locked, err := tryNamedLock(ctx, conn, m.cfg.LockName)
 	if err != nil {
 		return err
 	}
 	if !locked {
-		m.cfg.Logger.Debug("outbox partitions lock held by another session")
+		skipped = true
 
 		return nil
 	}
 	defer func() {
-		err = errors.Join(err, releaseNamedLock(ctx, conn, m.cfg.LockName))
+		releaseErr := releaseNamedLock(ctx, conn, m.cfg.LockName)
+		if releaseErr != nil {
+			if err != nil {
+				stage = maintenanceStageOperationAndRelease
+			} else {
+				stage = maintenanceStageReleaseLock
+			}
+		}
+		err = errors.Join(err, releaseErr)
 	}()
 
+	stage = "resolve_schema"
 	schema, table, err := resolveSchemaTable(ctx, conn, m.cfg.Table)
 	if err != nil {
 		return err
 	}
 
+	stage = "inspect"
 	info, err := loadPartitions(ctx, conn, schema, table)
 	if err != nil {
 		return err
 	}
 
+	stage = "plan"
 	plan, err := planPartitionChanges(m.cfg, info)
 	if err != nil {
 		return err
 	}
 	if len(plan.add) == 0 && len(plan.drop) == 0 {
+		completed = true
+
 		return nil
 	}
 
 	if len(plan.add) > 0 {
+		stage = "reorganize"
 		if err := m.reorganizeMax(ctx, conn, info.maxName, plan.add); err != nil {
 			return err
 		}
 	}
 	if len(plan.drop) > 0 {
+		stage = "drop"
 		if err := m.dropPartitions(ctx, conn, schema, table); err != nil {
 			return err
 		}
 	}
+
+	completed = true
 
 	return nil
 }
@@ -231,6 +265,7 @@ func (m *PartitionMaintainer) reorganizeMax(ctx context.Context, conn *sql.Conn,
 
 	m.cfg.Logger.Info(
 		"outbox partitions reorganize",
+		"event", "partitions.expansion_started", "operation", "partitions.reorganize", "outcome", "started",
 		"table",
 		m.cfg.Table,
 		"pmax",
@@ -249,6 +284,9 @@ func (m *PartitionMaintainer) reorganizeMax(ctx context.Context, conn *sql.Conn,
 	if _, err := conn.ExecContext(ctx, stmt); err != nil {
 		return fmt.Errorf("outbox mysql: reorganize partition failed: %w", err)
 	}
+	m.cfg.Logger.Info("outbox partitions expanded",
+		"event", "partitions.expansion_completed", "operation", "partitions.reorganize", "outcome", "succeeded",
+	)
 
 	return nil
 }
@@ -300,6 +338,7 @@ func (m *PartitionMaintainer) dropPartitions(
 	if len(dropped) > 0 {
 		m.cfg.Logger.Info(
 			"outbox partitions drop",
+			"event", "partitions.dropped", "operation", "partitions.drop", "outcome", "succeeded",
 			"table",
 			m.cfg.Table,
 			"partitions",

@@ -7,7 +7,7 @@ require (
 	github.com/moby/moby/api v1.55.0
 	github.com/stretchr/testify v1.12.1
 	github.com/testcontainers/testcontainers-go v0.44.0
-	github.com/velmie/outbox v0.3.0
+	github.com/velmie/outbox v0.4.0
 )
 
 require (

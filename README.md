@@ -447,12 +447,17 @@ func main() {
 		Limit:       10000,
 		IncludeDead: true,
 	})
+	log.Printf("confirmed processed=%d dead=%d", result.Processed, result.Dead)
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("processed=%d dead=%d", result.Processed, result.Dead)
 }
 ```
+
+`Cleanup` returns confirmed deletion counts even when a later step fails. Processed rows are deleted first,
+then optional dead rows use the remaining shared limit. The two DELETEs are separate autocommitted operations,
+so a dead-row failure does not roll back processed deletions. A failed DELETE or `RowsAffected` call contributes
+no count for that statement. With an error, a zero count does not prove that no rows were deleted.
 
 For automation, run the embedded maintainer or the CLI:
 
@@ -561,6 +566,10 @@ FOR UPDATE SKIP LOCKED;
 `Relay` accepts optional logger and metrics interfaces. The `Metrics` interface can be wired to
 Prometheus/StatsD/OpenTelemetry. Pending sampling is disabled by default. Enable it with
 `WithPendingInterval`.
+
+Classify diagnostics by their stable `event`, `operation`, and `outcome` fields. See the
+[diagnostic contract](docs/diagnostics.md) for relay and maintenance events and a tested safe logger adapter.
+Original errors remain available to adapters for inspection and require deliberate redaction before output.
 
 ```go
 package main
@@ -676,6 +685,7 @@ Reproduce: [docs/benchmarks.md](docs/benchmarks.md).
 See [docs/guide.md](docs/guide.md) for architecture, tuning, failure handling, cleanup, and extension notes.
 See [docs/benchmarks.md](docs/benchmarks.md) for the research harness and plotting workflow.
 See [docs/migration-v0.3.0.md](docs/migration-v0.3.0.md) to upgrade from v0.2.0 and enable durable retry delay.
+See [docs/release-v0.4.0.md](docs/release-v0.4.0.md) for the v0.4.0 release notes.
 See [docs/release-v0.3.0.md](docs/release-v0.3.0.md) for the v0.3.0 release notes.
 See [docs/migration-v0.2.0.md](docs/migration-v0.2.0.md) before upgrading from v0.1.1.
 See [docs/release-v0.2.0.md](docs/release-v0.2.0.md) for the v0.2.0 release notes.
@@ -713,7 +723,7 @@ done
 ```
 
 The complete gate requires Go 1.26.7, Git, tar, zip, Docker, golangci-lint 2.12.2, govulncheck 1.7.0, and Trivy 0.74.0.
-Run `./scripts/verify.sh` for the root, `mysql`, and `cmd` release gate. It verifies the v0.3.0 candidate module graph
+Run `./scripts/verify.sh` for the root, `mysql`, and `cmd` release gate. It verifies the v0.4.0 candidate module graph
 without `go.work`, then runs integration tests, `govulncheck`, and Trivy.
 
 ## License

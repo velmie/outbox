@@ -68,7 +68,10 @@ func (r *Relay) Run(ctx context.Context) error {
 			}()
 
 			if err := r.runWorker(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				r.cfg.Logger.Error("outbox worker error", "worker", workerID, "err", err)
+				r.cfg.Logger.Error("outbox worker error",
+					"event", "relay.worker_failed", "operation", "relay.run", "outcome", "failed",
+					"worker", workerID, "err", err,
+				)
 				errCh <- err
 				cancel()
 			}
@@ -290,7 +293,10 @@ func (r *Relay) handleDead(ctx context.Context, batch Batch, dead []Failure) err
 		return nil
 	}
 
-	r.cfg.Logger.Warn("outbox batch does not support dead-lettering; falling back to retry", "count", len(dead))
+	r.cfg.Logger.Warn("outbox batch does not support dead-lettering; falling back to retry",
+		"event", "relay.dead_letter_unsupported", "operation", "relay.dead_letter", "outcome", "unsupported",
+		"count", len(dead),
+	)
 	if err := batch.Fail(ctx, dead); err != nil {
 		return fmt.Errorf("outbox dead-letter fallback failed: %w", err)
 	}
@@ -303,7 +309,10 @@ func (r *Relay) reportWorkerPanic(workerID int) {
 		_ = recover()
 	}()
 
-	r.cfg.Logger.Error("outbox worker panic", "worker", workerID)
+	r.cfg.Logger.Error("outbox worker panic",
+		"event", "relay.worker_panicked", "operation", "relay.run", "outcome", "failed",
+		"worker", workerID,
+	)
 }
 
 func (r *Relay) sleep(ctx context.Context, d time.Duration) error {
@@ -347,7 +356,10 @@ func (r *Relay) maybeRecordPending(ctx context.Context) {
 
 	count, err := counter.PendingCount(ctx)
 	if err != nil {
-		r.cfg.Logger.Warn("outbox pending count failed", "err", err)
+		r.cfg.Logger.Warn("outbox pending count failed",
+			"event", "relay.pending_count_failed", "operation", "relay.pending_count", "outcome", "failed",
+			"err", err,
+		)
 
 		return
 	}
