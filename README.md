@@ -447,12 +447,17 @@ func main() {
 		Limit:       10000,
 		IncludeDead: true,
 	})
+	log.Printf("confirmed processed=%d dead=%d", result.Processed, result.Dead)
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("processed=%d dead=%d", result.Processed, result.Dead)
 }
 ```
+
+`Cleanup` returns confirmed deletion counts even when a later step fails. Processed rows are deleted first,
+then optional dead rows use the remaining shared limit. The two DELETEs are separate autocommitted operations,
+so a dead-row failure does not roll back processed deletions. A failed DELETE or `RowsAffected` call contributes
+no count for that statement. With an error, a zero count does not prove that no rows were deleted.
 
 For automation, run the embedded maintainer or the CLI:
 

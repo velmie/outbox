@@ -319,6 +319,17 @@ if err != nil {
 _ = result
 ```
 
+Always inspect `result` together with `err`. `Processed` and `Dead` contain only confirmed counts and may
+describe a partial cleanup when an error is returned. Cleanup executes the processed DELETE first and
+uses the remaining shared limit for the optional dead DELETE. These are separate autocommitted operations.
+If dead deletion fails, already confirmed processed deletions remain committed and are returned in
+`result.Processed` with the error.
+
+Each count is recorded only after its DELETE and `RowsAffected` both succeed. If either fails, the result
+does not infer a count for that statement. In particular, zero on an error path is not proof that the
+statement deleted nothing. The original cause remains available through the error chain. `CleanupMaintainer.Ensure`
+also preserves confirmed counts when its later advisory lock release fails.
+
 For automated cleanup in the application, use `mysql.CleanupMaintainer`:
 
 ```go

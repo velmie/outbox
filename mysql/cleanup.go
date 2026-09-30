@@ -26,7 +26,9 @@ type CleanupOptions struct {
 	IncludeDead bool
 }
 
-// CleanupResult reports how many rows were removed.
+// CleanupResult reports confirmed row deletions and may be partial when Cleanup returns an error.
+// A count is included only after both DELETE and RowsAffected succeed.
+// A zero count with an error does not prove that no rows were deleted.
 type CleanupResult struct {
 	Processed int64
 	Dead      int64
@@ -59,6 +61,9 @@ type CleanupMaintainer struct {
 }
 
 // Cleanup removes processed rows (and optionally dead rows) older than opts.Before.
+// It executes processed and dead DELETEs as separate autocommitted operations,
+// in that order, sharing opts.Limit. It does not wrap them in a transaction.
+// On error, the result retains counts confirmed by earlier successful DELETEs.
 func (s *Store) Cleanup(ctx context.Context, opts CleanupOptions) (CleanupResult, error) {
 	return s.cleanup(ctx, s.db, opts)
 }
@@ -203,7 +208,7 @@ func (s *Store) cleanup(ctx context.Context, exec Executor, opts CleanupOptions)
 	if opts.IncludeDead && remaining > 0 {
 		dead, err = s.cleanupByStatus(ctx, exec, outbox.StatusDead, "updated_at", opts.Before, remaining)
 		if err != nil {
-			return CleanupResult{}, err
+			return CleanupResult{Processed: processed}, err
 		}
 	}
 
