@@ -397,6 +397,8 @@ Recommended baseline for write-heavy outbox tables:
 - Track counts for `pending`, `processed`, `dead`.
 - Measure `attempt_count` distribution and handler latency.
 - Plug in your logger/metrics via `WithLogger` and `WithMetrics`.
+- Classify logger events using the stable fields in the [diagnostic contract](diagnostics.md).
+  Preserve error causes for inspection and select safe fields before formatting logs.
 - Pending sampling is disabled by default.
 - If the consumer implements `PendingCounter` (MySQL does), `Relay` samples pending counts when you enable `WithPendingInterval` and reports them via `Metrics.SetPending`.
 

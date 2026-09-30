@@ -48,7 +48,7 @@ type CleanupMaintainerConfig struct {
 	LockName string
 	// Clock overrides time source (useful for tests).
 	Clock outbox.Clock
-	// Logger receives warnings about cleanup failures.
+	// Logger receives structured cleanup diagnostics.
 	Logger outbox.Logger
 }
 
@@ -107,50 +107,77 @@ func (m *CleanupMaintainer) Run(ctx context.Context) error {
 	ticker := time.NewTicker(m.cfg.CheckEvery)
 	defer ticker.Stop()
 
-	if _, err := m.Ensure(ctx); err != nil {
-		m.cfg.Logger.Warn("outbox cleanup failed", "err", err)
-	}
+	_, _ = m.Ensure(ctx)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if _, err := m.Ensure(ctx); err != nil {
-				m.cfg.Logger.Warn("outbox cleanup failed", "err", err)
-			}
+			_, _ = m.Ensure(ctx)
 		}
 	}
 }
 
 // Ensure executes a single cleanup pass.
 func (m *CleanupMaintainer) Ensure(ctx context.Context) (result CleanupResult, err error) {
+	stage := maintenanceStageConnect
+	skipped := false
+	completed := false
+	defer func() {
+		switch {
+		case err != nil:
+			m.cfg.Logger.Warn("outbox cleanup failed",
+				"event", "cleanup.failed", "operation", "cleanup.ensure", "outcome", "failed", "stage", stage, "err", err,
+			)
+		case skipped:
+			m.cfg.Logger.Debug("outbox cleanup lock held by another session",
+				"event", "cleanup.skipped", "operation", "cleanup.ensure", "outcome", "skipped", "reason", "lock_busy",
+			)
+		case completed:
+			m.cfg.Logger.Debug("outbox cleanup completed", "event", "cleanup.completed", "operation", "cleanup.ensure", "outcome", "succeeded")
+		}
+	}()
+
 	conn, err := m.store.db.Conn(ctx)
 	if err != nil {
 		return CleanupResult{}, fmt.Errorf("outbox mysql: cleanup conn failed: %w", err)
 	}
 	defer conn.Close()
 
+	stage = maintenanceStageAcquireLock
 	locked, err := tryNamedLock(ctx, conn, m.cfg.LockName)
 	if err != nil {
 		return CleanupResult{}, err
 	}
 	if !locked {
-		m.cfg.Logger.Debug("outbox cleanup lock held by another session")
+		skipped = true
 
 		return CleanupResult{}, nil
 	}
 	defer func() {
-		err = errors.Join(err, releaseNamedLock(ctx, conn, m.cfg.LockName))
+		releaseErr := releaseNamedLock(ctx, conn, m.cfg.LockName)
+		if releaseErr != nil {
+			if err != nil {
+				stage = maintenanceStageOperationAndRelease
+			} else {
+				stage = maintenanceStageReleaseLock
+			}
+		}
+		err = errors.Join(err, releaseErr)
 	}()
 
+	stage = "cleanup"
 	before := m.cfg.Clock.Now().Add(-m.cfg.Retention)
 
-	return m.store.cleanup(ctx, conn, CleanupOptions{
+	result, err = m.store.cleanup(ctx, conn, CleanupOptions{
 		Before:      before,
 		Limit:       m.cfg.Limit,
 		IncludeDead: m.cfg.IncludeDead,
 	})
+	completed = true
+
+	return result, err
 }
 
 func (s *Store) cleanup(ctx context.Context, exec Executor, opts CleanupOptions) (CleanupResult, error) {

@@ -1,6 +1,16 @@
 package outbox
 
-// Logger provides structured logging hooks.
+// Logger provides structured logging hooks. Implementations must support
+// concurrent calls. Arguments are alternating string keys and values.
+//
+// Relay and maintenance diagnostics include stable string fields named event,
+// operation, and outcome. Classify these fields rather than the message or error
+// text. Maintenance failures also include a fixed stage, and lock contention
+// includes reason=lock_busy. See docs/diagnostics.md for the event vocabulary.
+//
+// The err field retains the original error for programmatic inspection. Errors
+// and other context may contain sensitive data. Adapters must select and validate
+// safe fields before formatting or exporting them. Panic values are not supplied.
 type Logger interface {
 	// Debug logs a debug message.
 	Debug(msg string, args ...any)

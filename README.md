@@ -562,6 +562,10 @@ FOR UPDATE SKIP LOCKED;
 Prometheus/StatsD/OpenTelemetry. Pending sampling is disabled by default. Enable it with
 `WithPendingInterval`.
 
+Classify diagnostics by their stable `event`, `operation`, and `outcome` fields. See the
+[diagnostic contract](docs/diagnostics.md) for relay and maintenance events and a tested safe logger adapter.
+Original errors remain available to adapters for inspection and require deliberate redaction before output.
+
 ```go
 package main
 
