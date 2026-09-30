@@ -6,6 +6,6 @@ use (
 	./mysql
 )
 
-replace github.com/velmie/outbox v0.3.0 => .
+replace github.com/velmie/outbox v0.4.0 => .
 
-replace github.com/velmie/outbox/mysql v0.3.0 => ./mysql
+replace github.com/velmie/outbox/mysql v0.4.0 => ./mysql

@@ -685,6 +685,7 @@ Reproduce: [docs/benchmarks.md](docs/benchmarks.md).
 See [docs/guide.md](docs/guide.md) for architecture, tuning, failure handling, cleanup, and extension notes.
 See [docs/benchmarks.md](docs/benchmarks.md) for the research harness and plotting workflow.
 See [docs/migration-v0.3.0.md](docs/migration-v0.3.0.md) to upgrade from v0.2.0 and enable durable retry delay.
+See [docs/release-v0.4.0.md](docs/release-v0.4.0.md) for the v0.4.0 release notes.
 See [docs/release-v0.3.0.md](docs/release-v0.3.0.md) for the v0.3.0 release notes.
 See [docs/migration-v0.2.0.md](docs/migration-v0.2.0.md) before upgrading from v0.1.1.
 See [docs/release-v0.2.0.md](docs/release-v0.2.0.md) for the v0.2.0 release notes.
@@ -722,7 +723,7 @@ done
 ```
 
 The complete gate requires Go 1.26.7, Git, tar, zip, Docker, golangci-lint 2.12.2, govulncheck 1.7.0, and Trivy 0.74.0.
-Run `./scripts/verify.sh` for the root, `mysql`, and `cmd` release gate. It verifies the v0.3.0 candidate module graph
+Run `./scripts/verify.sh` for the root, `mysql`, and `cmd` release gate. It verifies the v0.4.0 candidate module graph
 without `go.work`, then runs integration tests, `govulncheck`, and Trivy.
 
 ## License
