@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="v0.4.0"
+VERSION="v0.5.0"
 
 for command in go git tar zip; do
   if ! command -v "${command}" >/dev/null 2>&1; then
@@ -11,14 +11,14 @@ for command in go git tar zip; do
   fi
 done
 
-if [[ "$(GOWORK=off GOTOOLCHAIN=go1.26.7 go env GOVERSION)" != "go1.26.7" ]]; then
-  echo "release module check requires Go 1.26.7" >&2
+if [[ "$(GOWORK=off GOTOOLCHAIN=go1.26.10 go env GOVERSION)" != "go1.26.10" ]]; then
+  echo "release module check requires Go 1.26.10" >&2
   exit 1
 fi
 
 # Use the selected toolchain before switching to the isolated module cache and
 # file-only proxy, which contains release modules but no toolchain downloads.
-export PATH="$(GOWORK=off GOTOOLCHAIN=go1.26.7 go env GOROOT)/bin:${PATH}"
+export PATH="$(GOWORK=off GOTOOLCHAIN=go1.26.10 go env GOROOT)/bin:${PATH}"
 
 tmp_dir="$(mktemp -d)"
 cleanup() {
@@ -100,7 +100,7 @@ release_env=(
   "GONOPROXY=none"
   "GONOSUMDB=${no_sumdb}"
   "GOPROXY=file://${proxy_dir},${upstream_proxy}"
-  "GOTOOLCHAIN=go1.26.7"
+  "GOTOOLCHAIN=go1.26.10"
   "GOWORK=off"
 )
 
@@ -113,7 +113,7 @@ for module_path in \
     "GONOPROXY=none" \
     "GONOSUMDB=${no_sumdb}" \
     "GOPROXY=file://${proxy_dir}" \
-    "GOTOOLCHAIN=go1.26.7" \
+    "GOTOOLCHAIN=go1.26.10" \
     "GOWORK=off" \
     go mod download "${module_path}@${VERSION}"
 done

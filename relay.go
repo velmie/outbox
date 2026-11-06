@@ -5,13 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // FailureHandler is called when record processing returns an error.
-// It receives the original handler error. Implementations that log or persist
-// the record or error are responsible for handling sensitive data safely.
-// A handler panic is represented by a generic error without the panic value.
+// It receives the original handler error or an error containing the panic value.
 type FailureHandler func(ctx context.Context, record Record, err error)
 
 // Relay polls a Consumer and invokes a Handler for each record.
@@ -33,7 +32,9 @@ func NewRelay(consumer Consumer, handler Handler, opts ...RelayOption) *Relay {
 		panic("outbox: nil Handler")
 	}
 
-	var cfg RelayConfig
+	cfg := RelayConfig{
+		ShutdownTimeout: defaultShutdownTimeout,
+	}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
@@ -46,49 +47,90 @@ func NewRelay(consumer Consumer, handler Handler, opts ...RelayOption) *Relay {
 	}
 }
 
-// Run starts the polling loop with the configured number of workers.
+// Run polls with the configured workers until the parent stops or a worker
+// fails. It stops admitting polls and lets admitted batches finish within the
+// shared shutdown timeout. Parent cancellation and deadlines request shutdown
+// and return nil if the drain succeeds. Run cancels work when the budget expires
+// and waits for every worker, so handlers and dependencies must cooperate with
+// cancellation. Parent values are available to work without the parent deadline.
 func (r *Relay) Run(ctx context.Context) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	if ctx.Err() != nil {
+		return nil
+	}
+	stopCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	workCtx, cancelWork := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelWork()
 
 	errCh := make(chan error, r.cfg.Workers)
-	var wg sync.WaitGroup
+	finished := make(chan time.Time, 1)
+	var remaining atomic.Int64
+	remaining.Store(int64(r.cfg.Workers))
 
 	for i := 0; i < r.cfg.Workers; i++ {
-		wg.Add(1)
 		workerID := i
 		go func() {
-			defer wg.Done()
 			defer func() {
-				if recover() != nil {
-					errCh <- ErrWorkerPanic
-					cancel()
-					r.reportWorkerPanic(workerID)
+				if remaining.Add(-1) == 0 {
+					finished <- time.Now()
+				}
+			}()
+			var workerErr error
+			defer func() {
+				if value := recover(); value != nil {
+					panicErr := recoveredError(ErrWorkerPanic, value)
+					workerErr = errors.Join(workerErr, panicErr)
+					stop()
+					r.reportWorkerPanic(workerID, panicErr)
+				}
+				if workerErr != nil {
+					errCh <- workerErr
 				}
 			}()
 
-			if err := r.runWorker(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			if err := r.runWorker(stopCtx, workCtx); err != nil {
+				workerErr = err
+				stop()
 				r.cfg.Logger.Error("outbox worker error",
 					"event", "relay.worker_failed", "operation", "relay.run", "outcome", "failed",
 					"worker", workerID, "err", err,
 				)
-				errCh <- err
-				cancel()
 			}
 		}()
 	}
 
-	wg.Wait()
+	<-stopCtx.Done()
+	var timedOut bool
+	if r.cfg.ShutdownTimeout <= 0 {
+		cancelWork()
+		<-finished
+	} else {
+		deadline := time.Now().Add(r.cfg.ShutdownTimeout)
+		timer := time.NewTimer(r.cfg.ShutdownTimeout)
+		defer timer.Stop()
+		select {
+		case completedAt := <-finished:
+			timedOut = !completedAt.Before(deadline)
+		case <-timer.C:
+			cancelWork()
+			completedAt := <-finished
+			timedOut = !completedAt.Before(deadline)
+		}
+	}
 	close(errCh)
-
-	if err := <-errCh; err != nil {
-		return err
+	var result error
+	for err := range errCh {
+		result = errors.Join(result, err)
 	}
-	if err := ctx.Err(); err != nil && !errors.Is(err, context.Canceled) {
-		return err
+	if timedOut {
+		result = errors.Join(result, fmt.Errorf(
+			"outbox relay shutdown timed out after %s: %w",
+			r.cfg.ShutdownTimeout,
+			context.DeadlineExceeded,
+		))
 	}
 
-	return nil
+	return result
 }
 
 // ProcessOnce fetches and processes a single batch.
@@ -117,29 +159,29 @@ type batchOutcome struct {
 	dead       []Failure
 }
 
-func (r *Relay) runWorker(ctx context.Context) error {
+func (r *Relay) runWorker(stopCtx, workCtx context.Context) error {
 	for {
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-stopCtx.Done():
+			return nil
 		default:
 		}
 
-		batch, err := r.fetchBatch(ctx)
+		batch, err := r.fetchBatch(workCtx)
 		if err != nil {
 			if errors.Is(err, ErrNoRecords) {
-				r.maybeRecordPending(ctx)
-				if sleepErr := r.sleep(ctx, r.cfg.PollInterval); sleepErr != nil {
-					return sleepErr
+				r.maybeRecordPending(stopCtx)
+				if !r.sleep(stopCtx, r.cfg.PollInterval) {
+					return nil
 				}
 
 				continue
 			}
 
-			return err
+			return fmt.Errorf("outbox fetch failed: %w", err)
 		}
 
-		if err := r.processBatch(ctx, batch); err != nil {
+		if err := r.processBatch(workCtx, batch); err != nil {
 			return err
 		}
 	}
@@ -160,11 +202,17 @@ func (r *Relay) processBatch(ctx context.Context, batch Batch) (err error) {
 	}
 	committed := false
 	defer func() {
-		if committed {
-			return
+		value := recover()
+		if !committed {
+			if rollbackErr := batch.Rollback(); rollbackErr != nil {
+				err = errors.Join(err, fmt.Errorf("outbox rollback failed: %w", rollbackErr))
+			}
 		}
-		if rollbackErr := batch.Rollback(); rollbackErr != nil {
-			err = errors.Join(err, fmt.Errorf("outbox rollback failed: %w", rollbackErr))
+		if value != nil {
+			if err != nil {
+				panic(errors.Join(panicCause(value), err))
+			}
+			panic(value)
 		}
 	}()
 
@@ -201,6 +249,9 @@ func (r *Relay) collectBatchResults(ctx context.Context, records []Record) (batc
 		dead:       make([]Failure, 0),
 	}
 	for i := range records {
+		if err := ctx.Err(); err != nil {
+			return outcome, fmt.Errorf("outbox batch interrupted: %w", err)
+		}
 		record := records[i]
 		handleCtx := ctx
 		cancel := func() {}
@@ -213,7 +264,10 @@ func (r *Relay) collectBatchResults(ctx context.Context, records []Record) (batc
 
 		if handlerErr != nil {
 			if ctx.Err() != nil {
-				return outcome, ctx.Err()
+				return outcome, errors.Join(
+					fmt.Errorf("outbox handler failed for record %s: %w", record.ID, handlerErr),
+					fmt.Errorf("outbox batch interrupted: %w", ctx.Err()),
+				)
 			}
 
 			persistedErr := errHandlerFailed
@@ -234,8 +288,8 @@ func (r *Relay) collectBatchResults(ctx context.Context, records []Record) (batc
 
 func (r *Relay) invokeHandler(ctx context.Context, record Record) (panicked bool, err error) {
 	defer func() {
-		if recover() != nil {
-			err = errHandlerPanicked
+		if value := recover(); value != nil {
+			err = recoveredError(errHandlerPanicked, value)
 			panicked = true
 		}
 	}()
@@ -304,20 +358,36 @@ func (r *Relay) handleDead(ctx context.Context, batch Batch, dead []Failure) err
 	return nil
 }
 
-func (r *Relay) reportWorkerPanic(workerID int) {
+func (r *Relay) reportWorkerPanic(workerID int, err error) {
 	defer func() {
 		_ = recover()
 	}()
 
 	r.cfg.Logger.Error("outbox worker panic",
 		"event", "relay.worker_panicked", "operation", "relay.run", "outcome", "failed",
-		"worker", workerID,
+		"worker", workerID, "err", err,
 	)
 }
 
-func (r *Relay) sleep(ctx context.Context, d time.Duration) error {
+func recoveredError(kind error, value any) error {
+	if cause, ok := value.(error); ok {
+		return fmt.Errorf("%w: %w", kind, cause)
+	}
+
+	return fmt.Errorf("%w: %v", kind, value)
+}
+
+func panicCause(value any) error {
+	if cause, ok := value.(error); ok {
+		return fmt.Errorf("panic: %w", cause)
+	}
+
+	return fmt.Errorf("panic: %v", value) //nolint:err113 // A recovered panic value is dynamic.
+}
+
+func (r *Relay) sleep(ctx context.Context, d time.Duration) bool {
 	if d <= 0 {
-		return nil
+		return true
 	}
 
 	timer := time.NewTimer(d)
@@ -325,9 +395,9 @@ func (r *Relay) sleep(ctx context.Context, d time.Duration) error {
 
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return false
 	case <-timer.C:
-		return nil
+		return true
 	}
 }
 

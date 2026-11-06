@@ -24,7 +24,6 @@ var (
 	// ErrInvalidID is returned when parsing, scanning, or validating an ID fails.
 	ErrInvalidID = errors.New("outbox id is invalid")
 	// ErrWorkerPanic indicates a relay worker panic.
-	// The error does not include the recovered panic value.
 	ErrWorkerPanic = errors.New("outbox worker panic")
 )
 

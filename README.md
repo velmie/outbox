@@ -10,7 +10,7 @@ with
 
 ## Installation
 
-The MySQL adapter and command modules require Go 1.26+. The root library alone supports Go 1.25+.
+The MySQL adapter and command modules require Go 1.26.10 or later. The root library alone supports Go 1.25+.
 
 ```bash
 go get github.com/velmie/outbox
@@ -32,7 +32,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"log"
 	"os"
 	"os/signal"
@@ -95,7 +94,7 @@ func main() {
 		outbox.WithPollInterval(50*time.Millisecond),
 	)
 
-	if err := relay.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+	if err := relay.Run(ctx); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -112,6 +111,20 @@ An opt-in durable retry delay temporarily excludes failed records until their st
 Delivery is at least once: publication may succeed before the relay can acknowledge and commit the row, so handlers
 and downstream consumers must be idempotent. Publish `Record.ID` as the stable message identifier so downstream
 consumers can deduplicate retries.
+
+### Shutdown
+
+`Run` stops admitting polling iterations when its parent is canceled or reaches its deadline, or when a worker
+fails. An already admitted fetch and its batch may finish within one shared five-second budget. Configure a
+different budget with `WithShutdownTimeout`; a non-positive duration cancels active work immediately. `Run`
+waits for every worker before returning. A handler, callback, logger, or driver operation that does not respond
+to cancellation can therefore extend shutdown beyond the budget. Keep the database, broker, and telemetry alive
+until `Run` returns.
+
+A successful parent-triggered stop returns `nil`, including on parent deadline expiry. Inspect the parent context
+when the caller needs to distinguish its cancellation from its deadline. A drain timeout wraps
+`context.DeadlineExceeded`; worker, batch, and cleanup failures are joined with their original causes.
+`ProcessOnce` continues to use its caller's context directly. See the [relay guide](docs/guide.md#relay).
 
 ## Package layout
 
@@ -555,9 +568,9 @@ FOR UPDATE SKIP LOCKED;
   waits for it to return, so the handler must observe `ctx` to finish near the deadline.
 - Relay-created failure details for returned errors, recovered handler panics, and errors returned after an elapsed
   handler deadline are limited to `outbox handler failed`, `outbox handler panicked`, and `outbox handler timed out`.
-  Panic values are discarded.
-- `WithErrorHandler` and `WithFailureClassifier` receive the original returned handler error and full record for
-  diagnostics and policy. These explicitly configured callbacks must not log or persist secrets blindly.
+  Callbacks and classifiers receive the original error or a recovered panic with its value and cause.
+- `WithShutdownTimeout` controls the shared drain allowance. It defaults to five seconds. Zero or a negative
+  duration cancels admitted work immediately.
 - Use `WithFailureClassifier` to mark non-retryable failures as dead immediately.
 - Raise `max_allowed_packet` if your JSON payloads can be large.
 
@@ -568,8 +581,8 @@ Prometheus/StatsD/OpenTelemetry. Pending sampling is disabled by default. Enable
 `WithPendingInterval`.
 
 Classify diagnostics by their stable `event`, `operation`, and `outcome` fields. See the
-[diagnostic contract](docs/diagnostics.md) for relay and maintenance events and a tested safe logger adapter.
-Original errors remain available to adapters for inspection and require deliberate redaction before output.
+[diagnostic contract](docs/diagnostics.md) for relay and maintenance events. `*slog.Logger` implements
+`outbox.Logger` directly and records the original error text.
 
 ```go
 package main
@@ -578,8 +591,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -599,13 +612,6 @@ func (relayMetrics) AddErrors(int)                      {}
 func (relayMetrics) AddRetries(int)                     {}
 func (relayMetrics) AddDead(int)                        {}
 func (relayMetrics) SetPending(int)                     {}
-
-type stdLogger struct{}
-
-func (stdLogger) Debug(msg string, args ...any) { log.Printf("DEBUG %s %v", msg, args) }
-func (stdLogger) Info(msg string, args ...any)  { log.Printf("INFO %s %v", msg, args) }
-func (stdLogger) Warn(msg string, args ...any)  { log.Printf("WARN %s %v", msg, args) }
-func (stdLogger) Error(msg string, args ...any) { log.Printf("ERROR %s %v", msg, args) }
 
 func main() {
 	dsn := os.Getenv("OUTBOX_DSN")
@@ -649,12 +655,12 @@ func main() {
 	})
 
 	relay := outbox.NewRelay(store, handler,
-		outbox.WithLogger(stdLogger{}),
+		outbox.WithLogger(slog.Default()),
 		outbox.WithMetrics(relayMetrics{}),
 		outbox.WithPendingInterval(5*time.Second),
 	)
 
-	if err := relay.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+	if err := relay.Run(ctx); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -685,6 +691,7 @@ Reproduce: [docs/benchmarks.md](docs/benchmarks.md).
 See [docs/guide.md](docs/guide.md) for architecture, tuning, failure handling, cleanup, and extension notes.
 See [docs/benchmarks.md](docs/benchmarks.md) for the research harness and plotting workflow.
 See [docs/migration-v0.3.0.md](docs/migration-v0.3.0.md) to upgrade from v0.2.0 and enable durable retry delay.
+See [docs/release-v0.5.0.md](docs/release-v0.5.0.md) for the v0.5.0 release notes.
 See [docs/release-v0.4.0.md](docs/release-v0.4.0.md) for the v0.4.0 release notes.
 See [docs/release-v0.3.0.md](docs/release-v0.3.0.md) for the v0.3.0 release notes.
 See [docs/migration-v0.2.0.md](docs/migration-v0.2.0.md) before upgrading from v0.1.1.
@@ -722,8 +729,8 @@ for module in . mysql cmd; do
 done
 ```
 
-The complete gate requires Go 1.26.7, Git, tar, zip, Docker, golangci-lint 2.12.2, govulncheck 1.7.0, and Trivy 0.74.0.
-Run `./scripts/verify.sh` for the root, `mysql`, and `cmd` release gate. It verifies the v0.4.0 candidate module graph
+The complete gate requires Go 1.26.10, Git, tar, zip, Docker, golangci-lint 2.12.2, govulncheck 1.7.0, and Trivy 0.74.0.
+Run `./scripts/verify.sh` for the root, `mysql`, and `cmd` release gate. It verifies the v0.5.0 candidate module graph
 without `go.work`, then runs integration tests, `govulncheck`, and Trivy.
 
 ## License

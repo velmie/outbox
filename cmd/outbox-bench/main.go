@@ -454,7 +454,7 @@ func runConsume(db *sql.DB, store *mysql.Store, cfg benchConfig) (result, error)
 	start := time.Now()
 	err = relay.Run(ctx)
 	duration := time.Since(start)
-	if err != nil && !errors.Is(err, context.Canceled) {
+	if err != nil {
 		return result{}, err
 	}
 	processed := metrics.Processed()
@@ -635,22 +635,18 @@ func runMixed(db *sql.DB, store *mysql.Store, cfg benchConfig) (result, error) {
 	usageStart := readResourceUsage()
 	start := time.Now()
 	if err := runProducers(ctx, db, store, cfg, state); err != nil {
-		cancel()
-
-		return result{}, err
+		return result{}, stopRelay(cancel, errCh, err)
 	}
 	stage.Store(int32(mixedStageDrain))
 
 	if err := drainMixed(ctx, cfg, state); err != nil {
-		cancel()
-
-		return result{}, err
+		return result{}, stopRelay(cancel, errCh, err)
 	}
 	stage.Store(int32(mixedStageDone))
 
 	cancel()
 	err := <-errCh
-	if err != nil && !errors.Is(err, context.Canceled) {
+	if err != nil {
 		return result{}, err
 	}
 	duration := time.Since(start)
@@ -777,6 +773,12 @@ func startRelay(ctx context.Context, store *mysql.Store, cfg benchConfig, handle
 	}()
 
 	return errCh
+}
+
+func stopRelay(cancel context.CancelFunc, done <-chan error, cause error) error {
+	cancel()
+
+	return errors.Join(cause, <-done)
 }
 
 func runProducers(ctx context.Context, db *sql.DB, store *mysql.Store, cfg benchConfig, state *mixedState) error {
