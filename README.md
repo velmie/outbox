@@ -10,7 +10,7 @@ with
 
 ## Installation
 
-The MySQL adapter and command modules require Go 1.26+. The root library alone supports Go 1.25+.
+The MySQL adapter and command modules require Go 1.26.10 or later. The root library alone supports Go 1.25+.
 
 ```bash
 go get github.com/velmie/outbox
@@ -729,7 +729,7 @@ for module in . mysql cmd; do
 done
 ```
 
-The complete gate requires Go 1.26.7, Git, tar, zip, Docker, golangci-lint 2.12.2, govulncheck 1.7.0, and Trivy 0.74.0.
+The complete gate requires Go 1.26.10, Git, tar, zip, Docker, golangci-lint 2.12.2, govulncheck 1.7.0, and Trivy 0.74.0.
 Run `./scripts/verify.sh` for the root, `mysql`, and `cmd` release gate. It verifies the v0.5.0 candidate module graph
 without `go.work`, then runs integration tests, `govulncheck`, and Trivy.
 

@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODULES=(. mysql cmd)
 
-export GOTOOLCHAIN=go1.26.7
+export GOTOOLCHAIN=go1.26.10
 export GOWORK="${ROOT_DIR}/go.work"
 
 for command in go git tar zip docker golangci-lint govulncheck trivy; do
@@ -14,8 +14,8 @@ for command in go git tar zip docker golangci-lint govulncheck trivy; do
   fi
 done
 
-if [[ "$(go env GOVERSION)" != "go1.26.7" ]]; then
-  echo "release gate requires Go 1.26.7" >&2
+if [[ "$(go env GOVERSION)" != "go1.26.10" ]]; then
+  echo "release gate requires Go 1.26.10" >&2
   exit 1
 fi
 if ! golangci-lint version | grep -Fq "version 2.12.2"; then

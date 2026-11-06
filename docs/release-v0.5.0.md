@@ -3,7 +3,8 @@
 v0.5.0 is a coordinated release of `github.com/velmie/outbox` at `v0.5.0`,
 `github.com/velmie/outbox/mysql` at `mysql/v0.5.0`, and `github.com/velmie/outbox/cmd` at `cmd/v0.5.0`.
 Keep modules and commands aligned. The root library requires Go 1.25 or later; the MySQL and command modules
-require Go 1.26 or later. MySQL 8.0 remains the minimum.
+require Go 1.26.10 or later. MySQL 8.0 remains the minimum. The Go patch and the MySQL and command modules'
+`github.com/klauspost/compress` dependency are updated to address security vulnerabilities.
 
 ## Relay shutdown
 

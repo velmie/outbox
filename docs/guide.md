@@ -1,7 +1,7 @@
 # outbox guide
 
 This guide covers the root library and MySQL adapter for production use. The MySQL adapter and commands require
-Go 1.26+; the root library alone supports Go 1.25+. The MySQL adapter requires MySQL 8.0+.
+Go 1.26.10 or later; the root library alone supports Go 1.25+. The MySQL adapter requires MySQL 8.0+.
 
 For the v0.1.1 to v0.2.0 transition, follow [the migration guide](migration-v0.2.0.md).
 For v0.3.0 and optional durable retry scheduling, follow [the v0.3.0 migration guide](migration-v0.3.0.md).
