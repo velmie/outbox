@@ -302,8 +302,8 @@ func TestRelayHandlerPanicBecomesFailureAndProcessingContinues(t *testing.T) {
 	if !processed {
 		t.Fatal("expected batch to be processed")
 	}
-	if callbackErr == nil || callbackErr.Error() != "outbox handler panicked" {
-		t.Fatalf("callback error = %v, want safe panic summary", callbackErr)
+	if callbackErr == nil || !strings.Contains(callbackErr.Error(), secret) {
+		t.Fatalf("callback error = %v, want panic value", callbackErr)
 	}
 	if len(batch.failures) != 1 {
 		t.Fatalf("failures = %d, want 1", len(batch.failures))
@@ -369,7 +369,7 @@ func TestRelayHandlerErrorPersistenceIsSecretSafe(t *testing.T) {
 	}
 }
 
-func TestRelayUnexpectedPanicRollsBackWithoutLeakingPayload(t *testing.T) {
+func TestRelayUnexpectedPanicRollsBackAndReportsValue(t *testing.T) {
 	const secret = "callback-panic-secret-sentinel"
 
 	batch := &fakeBatch{records: []Record{{ID: ID{1}}}}
@@ -389,11 +389,8 @@ func TestRelayUnexpectedPanicRollsBackWithoutLeakingPayload(t *testing.T) {
 	if !errors.Is(err, ErrWorkerPanic) {
 		t.Fatalf("Run error = %v, want ErrWorkerPanic", err)
 	}
-	if err.Error() != ErrWorkerPanic.Error() {
-		t.Fatalf("Run error = %q, want generic worker panic", err)
-	}
-	if strings.Contains(err.Error(), secret) {
-		t.Fatal("Run error contains panic payload")
+	if !strings.Contains(err.Error(), secret) {
+		t.Fatal("Run error omitted panic value")
 	}
 	if !batch.rolled || batch.committed {
 		t.Fatalf("rolled back = %t, committed = %t", batch.rolled, batch.committed)
@@ -405,8 +402,8 @@ func TestRelayUnexpectedPanicRollsBackWithoutLeakingPayload(t *testing.T) {
 	if !strings.Contains(logs, "outbox worker panic") {
 		t.Fatalf("logs = %q, want generic worker panic entry", logs)
 	}
-	if strings.Contains(logs, secret) {
-		t.Fatal("logs contain panic payload")
+	if !strings.Contains(logs, secret) {
+		t.Fatal("logs omitted panic value")
 	}
 }
 
@@ -627,7 +624,7 @@ func TestRelayRunCancelsOtherWorkers(t *testing.T) {
 		allowErr: make(chan struct{}, 1),
 		err:      errors.New("boom"),
 	}
-	relay := NewRelay(consumer, HandlerFunc(func(context.Context, Record) error { return nil }), WithWorkers(2))
+	relay := NewRelay(consumer, HandlerFunc(func(context.Context, Record) error { return nil }), WithWorkers(2), WithShutdownTimeout(0))
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -639,7 +636,7 @@ func TestRelayRunCancelsOtherWorkers(t *testing.T) {
 	consumer.allowErr <- struct{}{}
 
 	err := <-errCh
-	if err == nil || err.Error() != "boom" {
+	if !errors.Is(err, consumer.err) || !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected boom error, got %v", err)
 	}
 	if atomic.LoadInt32(&consumer.canceled) != 1 {

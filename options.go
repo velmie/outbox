@@ -3,10 +3,11 @@ package outbox
 import "time"
 
 const (
-	defaultBatchSize    = 50
-	defaultPollInterval = 50 * time.Millisecond
-	defaultWorkers      = 1
-	defaultPendingCheck = 0
+	defaultBatchSize       = 50
+	defaultPollInterval    = 50 * time.Millisecond
+	defaultWorkers         = 1
+	defaultPendingCheck    = 0
+	defaultShutdownTimeout = 5 * time.Second
 )
 
 // RelayConfig defines how the Relay polls and processes records.
@@ -27,6 +28,9 @@ type RelayConfig struct {
 	// for Handler.Handle to return and does not interrupt it.
 	HandlerTimeout  time.Duration
 	PendingInterval time.Duration
+	// ShutdownTimeout is the shared drain allowance for Run. Non-positive values
+	// cancel admitted work immediately. ProcessOnce is unaffected.
+	ShutdownTimeout time.Duration
 }
 
 // RelayOption configures Relay behavior.
@@ -70,8 +74,7 @@ func WithClock(clock Clock) RelayOption {
 }
 
 // WithErrorHandler registers a callback for handler failures.
-// The callback receives the original error returned by the handler and is
-// responsible for handling sensitive error and record data safely.
+// The callback receives the original error or a recovered handler panic.
 func WithErrorHandler(handler FailureHandler) RelayOption {
 	return func(c *RelayConfig) {
 		c.ErrorHandler = handler
@@ -93,7 +96,7 @@ func WithMetrics(metrics Metrics) RelayOption {
 }
 
 // WithFailureClassifier sets the failure classifier for retry/dead-letter decisions.
-// The classifier receives the original error returned by the handler.
+// The classifier receives the original handler error or a recovered handler panic.
 func WithFailureClassifier(classifier FailureClassifier) RelayOption {
 	return func(c *RelayConfig) {
 		c.FailureClassifier = classifier
@@ -105,6 +108,15 @@ func WithFailureClassifier(classifier FailureClassifier) RelayOption {
 func WithHandlerTimeout(timeout time.Duration) RelayOption {
 	return func(c *RelayConfig) {
 		c.HandlerTimeout = timeout
+	}
+}
+
+// WithShutdownTimeout sets the shared allowance for admitted work to finish
+// after Run stops polling. The default is five seconds. A non-positive timeout
+// cancels work immediately. Run always waits for workers to return.
+func WithShutdownTimeout(timeout time.Duration) RelayOption {
+	return func(c *RelayConfig) {
+		c.ShutdownTimeout = timeout
 	}
 }
 

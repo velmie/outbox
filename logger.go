@@ -8,9 +8,8 @@ package outbox
 // text. Maintenance failures also include a fixed stage, and lock contention
 // includes reason=lock_busy. See docs/diagnostics.md for the event vocabulary.
 //
-// The err field retains the original error for programmatic inspection. Errors
-// and other context may contain sensitive data. Adapters must select and validate
-// safe fields before formatting or exporting them. Panic values are not supplied.
+// The err field retains the original error for inspection and logging, including
+// recovered worker panic values.
 type Logger interface {
 	// Debug logs a debug message.
 	Debug(msg string, args ...any)

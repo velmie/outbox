@@ -16,7 +16,7 @@ handle unknown events without treating them as successful operations.
 | `event` | `operation` | `outcome` | Meaning |
 | --- | --- | --- | --- |
 | `relay.worker_failed` | `relay.run` | `failed` | A worker returned an error. |
-| `relay.worker_panicked` | `relay.run` | `failed` | A worker panic was recovered. The panic value is discarded. |
+| `relay.worker_panicked` | `relay.run` | `failed` | A worker panic was recovered; `err` includes the panic value. |
 | `relay.pending_count_failed` | `relay.pending_count` | `failed` | Pending sampling failed. Delivery can continue. |
 | `relay.dead_letter_unsupported` | `relay.dead_letter` | `unsupported` | The batch has no dead-letter support. A retry fallback will be attempted. |
 | `cleanup.skipped` | `cleanup.ensure` | `skipped` | Another session holds the advisory lock. No cleanup pass ran. |
@@ -62,25 +62,9 @@ as the overall result. Do not infer overall success from the last DDL event.
   `resolve_schema`, `inspect`, `plan`, `reorganize`, and `drop` instead of `cleanup`.
 - `operation_and_release` means both the operation and advisory lock release failed. The joined error
   retains both causes.
-- `err` is the original error, possibly wrapped or joined, on error events. Inspect it with
-  `errors.Is` or `errors.As` where appropriate. It is not safe to print automatically.
+- `err` is the original error, possibly wrapped or joined, on error events. Its text identifies the failure and
+  includes the dependency cause. Error-valued panics remain available through `errors.Is` and `errors.As`.
 
-Returned errors retain their existing causes. Handler callbacks also keep receiving the original
-handler error, while recovered panic values remain discarded. Pending-count errors are available
-through the logger's `err` value, even though `ProcessOnce` does not return those sampling errors.
-An adapter may inspect an error before producing a sanitized output record without replacing the
-error supplied to other consumers or returned by the public API.
-
-## Safe output adapter
-
-The executable [Logger example](../logger_example_test.go) demonstrates an application-owned adapter
-using the standard library. It preserves recognized event fields, validates
-the finite code vocabulary, and does not forward the original message, raw errors, arbitrary values,
-table names, or partition names. It also omits incidental numeric context such as worker IDs and counts.
-Unknown events are omitted by this example. Extend its allowed
-vocabulary deliberately when adopting new events.
-
-Apply selection before formatting. Forwarding `args` to a general logger and then removing the `err`
-key can already expose a sensitive value through another field, a `String` method, or an `Error`
-method. Validate values as well as keys. The library preserves original causes for consumers, so a
-logger that prints all supplied fields is responsible for its own confidentiality policy.
+Handler callbacks and classifiers receive the original error or a recovered panic error. Pending-count failures
+are available through the logger's `err` value, even though `ProcessOnce` does not return those sampling errors.
+Use the standard [Logger example](../logger_example_test.go): `*slog.Logger` implements `Logger` directly.

@@ -63,8 +63,8 @@ err := handler.Handle(ctx, record)
 ```
 
 Errors and handler panics trigger retry/dead accounting. Relay-created `Failure.Err` values contain only stable,
-secret-safe summaries. You can register an optional `FailureHandler` for logging or metrics; it receives the original
-returned handler error and full record, so it owns safe handling of those details. Panic values are discarded.
+summaries. An optional `FailureHandler` and `FailureClassifier` receive the original handler error and full record.
+Recovered handler panics are delivered as errors containing the panic value, with error-valued panics wrapped as causes.
 
 ### Consumer and Batch
 
@@ -82,6 +82,30 @@ Contract note: `Fetch` must return `ErrNoRecords` when there is no work and must
 `Relay` coordinates polling and processing:
 - `Run` runs worker goroutines that fetch batches and dispatch to the handler.
 - `ProcessOnce` processes a single batch.
+
+`Run` stops admission when its parent is canceled or expires, a worker fails, or a worker panics. A polling iteration
+admitted before that observation, including an active fetch and its entire transaction, can drain. No later iteration
+is admitted after stopping is observed. All workers share one five-second allowance starting at the first stop. Use
+`WithShutdownTimeout` to change it, or set a non-positive value to cancel work immediately. Pending sampling and
+empty-poll waits stop with admission. The relay does not drain the backlog or stop maintenance components.
+
+The work context keeps parent values but not its cancellation or deadline. On budget expiry the relay cancels work
+and joins all workers. The allowance does not bound a handler, callback, logger, or driver commit that does not return
+after cancellation. Keep the database, broker, and telemetry usable until `Run` returns. `ProcessOnce` uses its
+caller-owned context directly.
+
+| Situation | `Run` result |
+| --- | --- |
+| Parent canceled or expired, and admitted work finishes | `nil` |
+| Parent already stopped before admission | `nil` |
+| Handler error or panic committed as retry/dead | Processing continues |
+| Fetch, settlement, commit, or rollback failure | Actual failures with their causes |
+| Worker panic | Error matching `ErrWorkerPanic`, with panic value or cause |
+| Drain allowance expires | Error wrapping `context.DeadlineExceeded`, joined with actual failures |
+| Immediate mode | Actual failures, without a synthetic drain-timeout error |
+
+A batch may still complete after the allowance expires, but `Run` reports the timeout. To distinguish parent
+cancellation from parent deadline expiry after a clean stop, inspect `ctx.Err()` or `context.Cause(ctx)`.
 
 Useful options:
 - `WithHandlerTimeout` to give each handler call a cooperative context deadline. Relay invokes `Handle` synchronously
@@ -397,10 +421,10 @@ Recommended baseline for write-heavy outbox tables:
 
 ### Error handling
 
-- A handler panic becomes a generic per-record failure and does not stop the worker. Other panics before commit roll
-  back the batch; `Run` reports `ErrWorkerPanic` without the panic value.
-- Provide a `FailureHandler` to capture metrics and logs. It and `FailureClassifier` receive the original returned
-  handler error and full record, so configured callbacks must avoid exposing sensitive values.
+- A handler panic is processed as a per-record failure and does not stop the worker. Other panics before commit roll
+  back the batch; `Run` reports `ErrWorkerPanic` together with the recovered value and any rollback failure.
+- Provide a `FailureHandler` to capture metrics and logs. It and `FailureClassifier` receive the original handler
+  error or recovered panic and the full record.
 - Route `status = -1` rows to a manual DLQ workflow.
 
 ### Observability
@@ -409,7 +433,7 @@ Recommended baseline for write-heavy outbox tables:
 - Measure `attempt_count` distribution and handler latency.
 - Plug in your logger/metrics via `WithLogger` and `WithMetrics`.
 - Classify logger events using the stable fields in the [diagnostic contract](diagnostics.md).
-  Preserve error causes for inspection and select safe fields before formatting logs.
+  Preserve error causes and their text in diagnostic records.
 - Pending sampling is disabled by default.
 - If the consumer implements `PendingCounter` (MySQL does), `Relay` samples pending counts when you enable `WithPendingInterval` and reports them via `Metrics.SetPending`.
 

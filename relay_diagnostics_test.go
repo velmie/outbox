@@ -34,7 +34,7 @@ func TestRelayDiagnosticsClassifiedByFields(t *testing.T) {
 		{
 			name:  "worker panic",
 			event: "relay.worker_panicked", operation: "relay.run", outcome: "failed",
-			wantErr: ErrWorkerPanic,
+			wantErr: ErrWorkerPanic, logErr: ErrWorkerPanic,
 			run: func(logger Logger) error {
 				batch := &fakeBatch{records: []Record{{ID: ID{1}}}}
 				return NewRelay(staticConsumer{batch: batch}, HandlerFunc(func(context.Context, Record) error {
@@ -92,7 +92,7 @@ func TestRelayDiagnosticsClassifiedByFields(t *testing.T) {
 			if !errors.Is(loggedErr, tt.logErr) {
 				t.Fatal("logger lost the original cause")
 			}
-			if tt.logErr != nil {
+			if tt.logErr == source {
 				var cause *diagnosticError
 				if !errors.As(loggedErr, &cause) || cause != source {
 					t.Fatal("logger lost the original typed cause")
