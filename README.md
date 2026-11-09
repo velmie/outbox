@@ -19,6 +19,14 @@ go get github.com/velmie/outbox/mysql
 
 Install `github.com/velmie/outbox/mysql` when you use the MySQL adapter.
 
+## OpenTelemetry metrics
+
+Use `github.com/velmie/outbox/oteloutbox` to record relay metrics with an
+OpenTelemetry meter. Construct the adapter with `oteloutbox.NewMetrics(meter)`
+and pass it to `outbox.WithMetrics`. It records processed, error, retry, dead,
+pending and batch duration measurements without event attributes. Retry
+exhaustion is counted as a retry and explicit permanent decisions as dead.
+
 ## Quick Start
 
 Create the outbox table before starting the service. Generate its DDL with `mysql.Schema` or
