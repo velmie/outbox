@@ -212,6 +212,39 @@ continue using the existing enqueue contract. Missing scheduling schema causes a
 fallback to immediate retries. `RetrySchema` creates a non-partitioned JSON table; existing binary or partitioned
 tables can opt in through the explicit migration while retaining their payload and partition definitions.
 
+## Requeue dead records
+
+Requeue performs one bounded update of dead rows. Select by IDs, aggregate type, event type, or a
+combination. Selectors intersect with the store scope. At least one selector and a positive limit are
+required. The operation resets attempts, error and processed time, preserving the ID, payload, headers,
+deduplication key and creation time. Enable scheduling on the store to clear retry deadlines too.
+
+```go
+count, err := endpoint.Requeue(ctx, mysql.RequeueOptions{
+	EventType: "delivery",
+	Limit:     100,
+})
+if err != nil {
+	return err
+}
+_ = count
+```
+
+`Requeue` reports confirmed affected rows. An error does not prove that the database changed no rows.
+Check the affected records before deciding whether to run the operation again. Requeued deliveries can
+be delivered more than once, with the same ID.
+
+The `outbox-requeue` command runs one batch and prints the affected count. Set `OUTBOX_DSN` through a
+protected environment or secret manager. For example:
+
+```sh
+outbox-requeue -table outbox -aggregate-type endpoint-a -event-type delivery -limit 100 -retry-scheduling
+```
+
+Use repeated `-id` flags to select UUIDs, including previously stored UUID versions. `-retry-scheduling`
+clears `next_attempt_at` and requires that column. The default limit is 1000. Invalid arguments exit with
+status 2, execution failures with status 1, and success with status 0. The command does not retry mutations.
+
 ## MySQL schema
 
 Generate with `mysql.Schema("outbox")` or use the template below. Apply generated DDL through a controlled migration;
