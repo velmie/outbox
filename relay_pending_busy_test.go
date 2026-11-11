@@ -26,7 +26,7 @@ func TestRelaySamplesPendingDuringBusyProcessing(t *testing.T) {
 				}),
 			)
 			if mode == "worker" {
-				if err := relay.runWorker(ctx, ctx); err != nil {
+				if err := relay.Run(ctx); err != nil {
 					t.Fatal(err)
 				}
 			} else {
