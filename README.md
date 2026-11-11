@@ -292,7 +292,8 @@ For duplicate admission, enable `Deduplication` on an unpartitioned schema and s
 disables deduplication and works with existing schemas. On a conflict, `Enqueue` returns a zero ID
 and `outbox.ErrDuplicate`; this does not prove that the existing payload is equal. The original MySQL
 error is also available through `errors.As`. Commit the surrounding transaction before acknowledging
-the input, including when the application treats a duplicate as successful admission.
+the input, including when the application treats a duplicate as successful admission. Use a non-secret
+key: a MySQL duplicate-key error can contain the conflicting value.
 
 ```go
 entry := outbox.Entry{
@@ -808,8 +809,13 @@ Reproduce: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Docs
 
+The [delivery queue example](examples/delivery/README.md) exercises JetStream admission, MySQL, and HTTP
+delivery against test-owned dependencies.
+
 See [docs/guide.md](docs/guide.md) for architecture, tuning, failure handling, cleanup, and extension notes.
 See [docs/benchmarks.md](docs/benchmarks.md) for the research harness and plotting workflow.
+See [docs/migration-v0.6.0.md](docs/migration-v0.6.0.md) and [docs/release-v0.6.0.md](docs/release-v0.6.0.md)
+for the delivery queue capabilities and upgrade procedure.
 See [docs/migration-v0.3.0.md](docs/migration-v0.3.0.md) to upgrade from v0.2.0 and enable durable retry delay.
 See [docs/release-v0.5.0.md](docs/release-v0.5.0.md) for the v0.5.0 release notes.
 See [docs/release-v0.4.0.md](docs/release-v0.4.0.md) for the v0.4.0 release notes.
@@ -823,20 +829,22 @@ See [docs/release-v0.2.0.md](docs/release-v0.2.0.md) for the v0.2.0 release note
 for module in . mysql cmd; do
   (cd "$module" && go test -race ./... && go vet ./...)
 done
+(cd examples/delivery && GOWORK=off go test -race ./... && GOWORK=off go vet ./...)
 
 (cd mysql && go test -count=1 -tags=integration -timeout 12m ./...)
 (cd cmd && go test -count=1 -tags=integration -timeout 12m ./...)
+(cd examples/delivery && GOWORK=off go test -count=1 -tags=integration -timeout 12m ./...)
 ```
 
-The committed `go.work` makes the nested modules use the current checkout. Integration tests use Testcontainers and
-require a working Docker daemon; container startup failures fail the suite.
-CLI integration tests in `cmd/outbox-cleanup` and `cmd/outbox-partitions` build the binaries and run them in a container against a real MySQL container.
+The committed `go.work` connects the root, MySQL, and command modules. The separate example module resolves
+released library versions. Integration tests use Testcontainers and require a working Docker daemon; container
+startup failures fail the suite. CLI integration tests build the binaries and run them against real MySQL.
 
 Run only the CLI integration tests:
 
 ```bash
 cd cmd
-go test -tags=integration -timeout 5m ./outbox-cleanup ./outbox-partitions
+go test -tags=integration -timeout 5m ./outbox-cleanup ./outbox-partitions ./outbox-requeue
 ```
 
 ## Lint
@@ -847,11 +855,12 @@ repo_root="$(pwd)"
 for module in . mysql cmd; do
   (cd "$module" && golangci-lint run --config "$repo_root/.golangci.yml" ./...)
 done
+(cd examples/delivery && GOWORK=off golangci-lint run --config "$repo_root/.golangci.yml" ./...)
 ```
 
-The complete gate requires Go 1.26.10, Git, tar, zip, Docker, golangci-lint 2.12.2, govulncheck 1.7.0, and Trivy 0.74.0.
-Run `./scripts/verify.sh` for the root, `mysql`, and `cmd` release gate. It verifies the v0.5.0 candidate module graph
-without `go.work`, then runs integration tests, `govulncheck`, and Trivy.
+The complete gate requires Go 1.26.11, Git, tar, zip, Docker, golangci-lint 2.12.2, govulncheck 1.7.0, and Trivy 0.74.0.
+Run `./scripts/verify.sh` for the library, commands, and delivery example. It verifies the v0.6.0 candidate module
+graph without `go.work`, then runs integration tests, `govulncheck`, and Trivy.
 
 ## License
 

@@ -136,7 +136,8 @@ Key properties:
 - `SKIP LOCKED` allows multiple workers to progress without waiting.
 - `ORDER BY id` benefits from UUID v7 ordering.
 - `LIMIT` keeps transactions short.
-- The predicate considers the entire pending backlog; pending rows remain eligible regardless of UUID timestamp.
+- The predicate considers the pending backlog within the configured scope, or the whole table when unscoped.
+  Pending rows remain eligible regardless of UUID timestamp.
 
 With `mysql.WithRetryDelay` set to a positive duration or `mysql.WithRetrySchedule` enabled, the predicate also requires
 `next_attempt_at IS NULL OR next_attempt_at <= UTC_TIMESTAMP(6)`. This temporarily excludes delayed retries while

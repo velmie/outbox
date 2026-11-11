@@ -68,3 +68,9 @@ as the overall result. Do not infer overall success from the last DDL event.
 Handler callbacks and classifiers receive the original error or a recovered panic error. Pending-count failures
 are available through the logger's `err` value, even though `ProcessOnce` does not return those sampling errors.
 Use the standard [Logger example](../logger_example_test.go): `*slog.Logger` implements `Logger` directly.
+
+A retryable positive delay hint on a store without retry scheduling causes a settlement error identifying
+the record. The relay rolls back the batch. `Run` reports the worker failure and stops admission;
+`ProcessOnce` returns the error directly. No committed-outcome counters are incremented for the rollback.
+`WithErrorDetails` opts into persisting handler error text and panic values. Enable it only when these
+values are safe to store. Callback and classifier errors remain original and untruncated.

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="v0.5.0"
+VERSION="v0.6.0"
 
 for command in go git tar zip; do
   if ! command -v "${command}" >/dev/null 2>&1; then
@@ -11,14 +11,14 @@ for command in go git tar zip; do
   fi
 done
 
-if [[ "$(GOWORK=off GOTOOLCHAIN=go1.26.10 go env GOVERSION)" != "go1.26.10" ]]; then
-  echo "release module check requires Go 1.26.10" >&2
+if [[ "$(GOWORK=off GOTOOLCHAIN=go1.26.11 go env GOVERSION)" != "go1.26.11" ]]; then
+  echo "release module check requires Go 1.26.11" >&2
   exit 1
 fi
 
 # Use the selected toolchain before switching to the isolated module cache and
 # file-only proxy, which contains release modules but no toolchain downloads.
-export PATH="$(GOWORK=off GOTOOLCHAIN=go1.26.10 go env GOROOT)/bin:${PATH}"
+export PATH="$(GOWORK=off GOTOOLCHAIN=go1.26.11 go env GOROOT)/bin:${PATH}"
 
 tmp_dir="$(mktemp -d)"
 cleanup() {
@@ -54,7 +54,7 @@ create_proxy_version() {
 
   mkdir -p "${proxy_version_dir}" "${stage_dir}/${prefix}"
   if [[ "${module_dir}" == "." ]]; then
-    tar -C "${snapshot_dir}" --exclude='./cmd' --exclude='./mysql' --exclude='./vendor' -cf - . \
+    tar -C "${snapshot_dir}" --exclude='./cmd' --exclude='./mysql' --exclude='./examples/delivery' --exclude='./vendor' -cf - . \
       | tar -C "${stage_dir}/${prefix}" -xf -
     module_file="${snapshot_dir}/go.mod"
   else
@@ -100,7 +100,7 @@ release_env=(
   "GONOPROXY=none"
   "GONOSUMDB=${no_sumdb}"
   "GOPROXY=file://${proxy_dir},${upstream_proxy}"
-  "GOTOOLCHAIN=go1.26.10"
+  "GOTOOLCHAIN=go1.26.11"
   "GOWORK=off"
 )
 
@@ -113,12 +113,12 @@ for module_path in \
     "GONOPROXY=none" \
     "GONOSUMDB=${no_sumdb}" \
     "GOPROXY=file://${proxy_dir}" \
-    "GOTOOLCHAIN=go1.26.10" \
+    "GOTOOLCHAIN=go1.26.11" \
     "GOWORK=off" \
     go mod download "${module_path}@${VERSION}"
 done
 
-for module in . mysql cmd; do
+for module in . mysql cmd examples/delivery; do
   module_dir="${ROOT_DIR}/${module}"
   echo "==> ${module}: GOWORK=off release metadata and tests"
   (
@@ -138,12 +138,12 @@ grep -Fxq "github.com/velmie/outbox ${VERSION}" <<<"${cmd_graph}"
 grep -Fxq "github.com/velmie/outbox/mysql ${VERSION}" <<<"${cmd_graph}"
 
 if grep -Eq '^[[:space:]]*replace([[:space:]]|$)' \
-  "${ROOT_DIR}/go.mod" "${ROOT_DIR}/mysql/go.mod" "${ROOT_DIR}/cmd/go.mod"; then
+  "${ROOT_DIR}/go.mod" "${ROOT_DIR}/mysql/go.mod" "${ROOT_DIR}/cmd/go.mod" "${ROOT_DIR}/examples/delivery/go.mod"; then
   echo "release modules must not contain replace directives" >&2
   exit 1
 fi
 
-for command_path in outbox-bench outbox-cleanup outbox-partitions; do
+for command_path in outbox-bench outbox-cleanup outbox-partitions outbox-requeue; do
   env "${release_env[@]}" "GOBIN=${bin_dir}" \
     go install "github.com/velmie/outbox/cmd/${command_path}@${VERSION}"
   test -x "${bin_dir}/${command_path}"

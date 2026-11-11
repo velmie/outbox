@@ -9,7 +9,7 @@ still supports Go 1.25. MySQL 8.0 remains the database minimum.
 
 Update application build images, CI jobs, and local toolchains to Go 1.26 or later before upgrading the MySQL
 adapter or commands. Their `golang.org/x/crypto v0.56.0` dependency fixes SSH vulnerabilities and requires Go 1.26.
-This toolchain requirement applies even when retry scheduling is disabled. Repository release checks use Go 1.26.10.
+This toolchain requirement applies even when retry scheduling is disabled.
 
 For a service using the MySQL adapter, update both module requirements:
 
