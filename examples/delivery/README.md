@@ -8,7 +8,7 @@ Delivery remains at least once, and the receiver gets the outbox ID on each atte
 Run it with Docker available:
 
 ```sh
-go test -tags=integration -count=1 ./...
+GOWORK=off go test -tags=integration -count=1 ./...
 ```
 
 The test owns its MySQL and NATS containers and its local HTTP server. The dependencies are pinned in

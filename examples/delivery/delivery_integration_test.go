@@ -25,10 +25,9 @@ import (
 
 func TestDeliveryQueueEndToEnd(t *testing.T) {
 	ctx := context.Background()
-	container, db := startMySQLContainer(t, ctx)
+	db := startMySQLContainer(t, ctx)
 	t.Cleanup(func() {
 		require.NoError(t, db.Close())
-		require.NoError(t, container.Terminate(ctx))
 	})
 	ddl, err := mysql.SchemaWithOptions("outbox", mysql.SchemaOptions{
 		BinaryPayload:      true,

@@ -27,7 +27,7 @@ const (
 	natsImage  = "nats:2.15.0@sha256:cd3fcd4ecdda44e3a66728a5334af0a959bc3979b32810e033d1c547241cd0f4"
 )
 
-func startMySQLContainer(t *testing.T, ctx context.Context) (testcontainers.Container, *sql.DB) {
+func startMySQLContainer(t *testing.T, ctx context.Context) *sql.DB {
 	t.Helper()
 	password := rand.Text()
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
@@ -44,23 +44,15 @@ func startMySQLContainer(t *testing.T, ctx context.Context) (testcontainers.Cont
 		},
 		Started: true,
 	})
+	testcontainers.CleanupContainer(t, container)
 	require.NoError(t, err)
 	host, err := container.Host(ctx)
-	if err != nil {
-		require.NoError(t, container.Terminate(context.Background()))
-		require.NoError(t, err)
-	}
+	require.NoError(t, err)
 	port, err := container.MappedPort(ctx, "3306/tcp")
-	if err != nil {
-		require.NoError(t, container.Terminate(context.Background()))
-		require.NoError(t, err)
-	}
+	require.NoError(t, err)
 	db, err := sql.Open("mysql", fmt.Sprintf("root:%s@tcp(%s:%s)/outbox?parseTime=true", password, host, port.Port()))
-	if err != nil {
-		require.NoError(t, container.Terminate(context.Background()))
-		require.NoError(t, err)
-	}
-	return container, db
+	require.NoError(t, err)
+	return db
 }
 
 func startNATS(t *testing.T, ctx context.Context) nats.JetStreamContext {
@@ -74,8 +66,8 @@ func startNATS(t *testing.T, ctx context.Context) nats.JetStreamContext {
 		},
 		Started: true,
 	})
+	testcontainers.CleanupContainer(t, container)
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, container.Terminate(context.Background())) })
 	host, err := container.Host(ctx)
 	require.NoError(t, err)
 	port, err := container.MappedPort(ctx, "4222/tcp")
