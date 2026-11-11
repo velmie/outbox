@@ -19,6 +19,49 @@ go get github.com/velmie/outbox/mysql
 
 Install `github.com/velmie/outbox/mysql` when you use the MySQL adapter.
 
+## OpenTelemetry metrics
+
+Use `github.com/velmie/outbox/oteloutbox` to record relay metrics with an
+OpenTelemetry meter. Construct the adapter with `oteloutbox.NewMetrics` and pass
+it to `outbox.WithMetrics`. It records processed, error, retry, dead, pending and
+batch duration measurements with optional fixed attributes. Retry
+exhaustion is counted as a retry and explicit permanent decisions as dead.
+
+```bash
+go get github.com/velmie/outbox/oteloutbox
+```
+
+Given an application-configured `metric.Meter`, an outbox consumer and a handler:
+
+```go
+func newRelay(meter metric.Meter, consumer outbox.Consumer, handler outbox.Handler) (*outbox.Relay, error) {
+    metrics, err := oteloutbox.NewMetrics(meter, attribute.String("endpoint", "orders"))
+    if err != nil {
+        return nil, err
+    }
+    return outbox.NewRelay(
+        consumer,
+        handler,
+        outbox.WithMetrics(metrics),
+        outbox.WithPendingInterval(5*time.Second),
+    ), nil
+}
+```
+
+Import `time`, `go.opentelemetry.io/otel/attribute`, `go.opentelemetry.io/otel/metric`, `github.com/velmie/outbox` and
+`github.com/velmie/outbox/oteloutbox`. Configure the meter provider with a reader
+and exporter in the application. Pending sampling requires a consumer that
+implements `outbox.PendingCounter` and a positive sampling interval.
+
+Attributes apply to every measurement from the adapter. Use bounded identifiers
+to limit metric cardinality. Adapters with identical attribute sets share a
+metric series, including the pending gauge. Omit attributes with
+`oteloutbox.NewMetrics(meter)` when no distinction is needed.
+
+Counters and the pending gauge use the unit `{record}`. Batch duration uses
+seconds and suggests explicit buckets from 5 ms through 10 s; the provider can
+override the aggregation.
+
 ## Quick Start
 
 Create the outbox table before starting the service. Generate its DDL with `mysql.Schema` or
