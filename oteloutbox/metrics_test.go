@@ -3,10 +3,12 @@ package oteloutbox
 import (
 	"context"
 	"errors"
+	"reflect"
 	"slices"
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -14,6 +16,88 @@ import (
 
 	"github.com/velmie/outbox"
 )
+
+func TestMetricsRecordDistinctAttributeSeries(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+	meter := provider.Meter("test")
+	attrs := []attribute.KeyValue{attribute.String("endpoint", "first")}
+	first, err := NewMetrics(meter, attrs...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attrs[0] = attribute.String("endpoint", "changed")
+	second, err := NewMetrics(meter, attribute.String("endpoint", "second"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first.AddProcessed(1)
+	first.AddErrors(2)
+	first.AddRetries(3)
+	first.AddDead(4)
+	first.SetPending(9)
+	first.SetPending(0)
+	first.ObserveBatchDuration(250 * time.Millisecond)
+	second.AddProcessed(5)
+	second.AddErrors(6)
+	second.AddRetries(7)
+	second.AddDead(8)
+	second.SetPending(11)
+	second.ObserveBatchDuration(500 * time.Millisecond)
+
+	var result metricdata.ResourceMetrics
+	if err := reader.Collect(t.Context(), &result); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]map[string]float64{
+		"outbox.processed":      {"first": 1, "second": 5},
+		"outbox.errors":         {"first": 2, "second": 6},
+		"outbox.retries":        {"first": 3, "second": 7},
+		"outbox.dead":           {"first": 4, "second": 8},
+		"outbox.pending":        {"first": 0, "second": 11},
+		"outbox.batch.duration": {"first": 0.25, "second": 0.5},
+	}
+	seen := make(map[string]map[string]float64)
+	for _, scope := range result.ScopeMetrics {
+		for _, measurement := range scope.Metrics {
+			points := make(map[string]float64)
+			switch data := measurement.Data.(type) {
+			case metricdata.Sum[int64]:
+				for _, point := range data.DataPoints {
+					endpoint, ok := point.Attributes.Value("endpoint")
+					if !ok || point.Attributes.Len() != 1 {
+						t.Fatalf("%s: unexpected attributes %v", measurement.Name, point.Attributes)
+					}
+					points[endpoint.AsString()] = float64(point.Value)
+				}
+			case metricdata.Gauge[int64]:
+				for _, point := range data.DataPoints {
+					endpoint, ok := point.Attributes.Value("endpoint")
+					if !ok || point.Attributes.Len() != 1 {
+						t.Fatalf("%s: unexpected attributes %v", measurement.Name, point.Attributes)
+					}
+					points[endpoint.AsString()] = float64(point.Value)
+				}
+			case metricdata.Histogram[float64]:
+				for _, point := range data.DataPoints {
+					endpoint, ok := point.Attributes.Value("endpoint")
+					if !ok || point.Attributes.Len() != 1 || point.Count != 1 {
+						t.Fatalf("%s: unexpected point %+v", measurement.Name, point)
+					}
+					points[endpoint.AsString()] = point.Sum
+				}
+			default:
+				t.Fatalf("unexpected instrument=%+v", measurement)
+			}
+			seen[measurement.Name] = points
+		}
+	}
+	if !reflect.DeepEqual(seen, want) {
+		t.Fatalf("measurements = %v, want %v", seen, want)
+	}
+}
 
 func TestMetricsRecordWithoutAttributes(t *testing.T) {
 	reader := sdkmetric.NewManualReader()

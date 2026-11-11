@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 
 	"github.com/velmie/outbox"
@@ -17,7 +18,7 @@ func ExampleNewMetrics() {
 	provider := sdkmetric.NewMeterProvider()
 	defer func() { _ = provider.Shutdown(context.Background()) }()
 
-	metrics, err := oteloutbox.NewMetrics(provider.Meter("orders"))
+	metrics, err := oteloutbox.NewMetrics(provider.Meter("orders"), attribute.String("endpoint", "orders"))
 	if err != nil {
 		fmt.Println(err)
 		return

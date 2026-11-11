@@ -5,10 +5,11 @@ import (
 	"fmt"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 )
 
-// Metrics records the released relay's committed outcomes without event labels.
+// Metrics records the released relay's committed outcomes with fixed attributes.
 // Retry exhaustion belongs to retries. Dead counts explicit permanent decisions.
 type Metrics struct {
 	processed metric.Int64Counter
@@ -17,12 +18,14 @@ type Metrics struct {
 	dead      metric.Int64Counter
 	pending   metric.Int64Gauge
 	duration  metric.Float64Histogram
+	attrs     metric.MeasurementOption
 }
 
-// NewMetrics creates instruments for outbox relay outcomes. Batch durations are
-// recorded in seconds with suggested explicit bucket boundaries from 5 ms to
-// 10 s. The meter provider can override the suggested aggregation.
-func NewMetrics(meter metric.Meter) (*Metrics, error) {
+// NewMetrics creates instruments for outbox relay outcomes with fixed attributes.
+// Use bounded identifiers; identical attribute sets share a metric series.
+// Batch durations are recorded in seconds with suggested explicit bucket
+// boundaries from 5 ms to 10 s. The meter provider can override the aggregation.
+func NewMetrics(meter metric.Meter, attrs ...attribute.KeyValue) (*Metrics, error) {
 	processed, err := meter.Int64Counter(
 		"outbox.processed",
 		metric.WithUnit("{record}"),
@@ -81,25 +84,30 @@ func NewMetrics(meter metric.Meter) (*Metrics, error) {
 		dead:      dead,
 		pending:   pending,
 		duration:  duration,
+		attrs:     metric.WithAttributes(attrs...),
 	}, nil
 }
 
 // AddProcessed records processed records.
-func (m *Metrics) AddProcessed(count int) { m.processed.Add(context.Background(), int64(count)) }
+func (m *Metrics) AddProcessed(count int) {
+	m.processed.Add(context.Background(), int64(count), m.attrs)
+}
 
 // AddErrors records handler errors.
-func (m *Metrics) AddErrors(count int) { m.failures.Add(context.Background(), int64(count)) }
+func (m *Metrics) AddErrors(count int) { m.failures.Add(context.Background(), int64(count), m.attrs) }
 
 // AddRetries records retries.
-func (m *Metrics) AddRetries(count int) { m.retries.Add(context.Background(), int64(count)) }
+func (m *Metrics) AddRetries(count int) { m.retries.Add(context.Background(), int64(count), m.attrs) }
 
 // AddDead records permanent failures.
-func (m *Metrics) AddDead(count int) { m.dead.Add(context.Background(), int64(count)) }
+func (m *Metrics) AddDead(count int) { m.dead.Add(context.Background(), int64(count), m.attrs) }
 
 // SetPending records the pending count.
-func (m *Metrics) SetPending(count int) { m.pending.Record(context.Background(), int64(count)) }
+func (m *Metrics) SetPending(count int) {
+	m.pending.Record(context.Background(), int64(count), m.attrs)
+}
 
 // ObserveBatchDuration records batch processing time.
 func (m *Metrics) ObserveBatchDuration(duration time.Duration) {
-	m.duration.Record(context.Background(), duration.Seconds())
+	m.duration.Record(context.Background(), duration.Seconds(), m.attrs)
 }
