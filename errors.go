@@ -3,6 +3,9 @@ package outbox
 import "errors"
 
 var (
+	// ErrDuplicate identifies an insert conflicting with an existing unique key.
+	// It does not establish payload equality.
+	ErrDuplicate = errors.New("outbox entry already exists")
 	// ErrInvalidBatchSize indicates that the requested batch size is not positive.
 	ErrInvalidBatchSize = errors.New("outbox batch size must be positive")
 	// ErrNoRecords signals that no records are available for processing.
@@ -28,6 +31,7 @@ var (
 )
 
 var (
+	errDedupKeyTooLong = errors.New("outbox deduplication key must be at most 512 bytes")
 	errHandlerFailed   = errors.New("outbox handler failed")
 	errHandlerPanicked = errors.New("outbox handler panicked")
 	errHandlerTimedOut = errors.New("outbox handler timed out")

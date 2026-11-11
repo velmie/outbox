@@ -8,6 +8,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	mysqldriver "github.com/go-sql-driver/mysql"
+
 	"github.com/velmie/outbox"
 )
 
@@ -105,17 +107,26 @@ func (s *Store) Enqueue(ctx context.Context, exec Executor, entry outbox.Entry) 
 		headers = entry.Headers
 	}
 
-	_, err := exec.ExecContext(
-		ctx,
-		s.queries.insert,
+	query := s.queries.insert
+	args := []any{
 		id,
 		entry.AggregateType,
 		entry.AggregateID,
 		entry.EventType,
 		entry.Payload,
 		headers,
-	)
+	}
+	if entry.DedupKey != "" {
+		query = s.queries.insertDedup
+		args = append(args, []byte(entry.DedupKey))
+	}
+	_, err := exec.ExecContext(ctx, query, args...)
 	if err != nil {
+		var mysqlErr *mysqldriver.MySQLError
+		if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 {
+			return outbox.ID{}, fmt.Errorf("outbox mysql: insert failed: %w: %w", outbox.ErrDuplicate, err)
+		}
+
 		return outbox.ID{}, fmt.Errorf("outbox mysql: insert failed: %w", err)
 	}
 

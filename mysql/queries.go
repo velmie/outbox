@@ -6,6 +6,7 @@ const aggregateScopePredicate = " AND aggregate_type = ?"
 
 type queries struct {
 	insert           string
+	insertDedup      string
 	selectPending    string
 	updateFailureOne string
 	updateDeadOne    string
@@ -28,6 +29,10 @@ func newQueries(table string, retry, scoped bool) queries {
 
 	cols := "id, aggregate_type, aggregate_id, event_type, payload, headers, created_at, attempt_count"
 	insert := fmt.Sprintf("INSERT INTO %s (id, aggregate_type, aggregate_id, event_type, payload, headers) VALUES (?, ?, ?, ?, ?, ?)", table)
+	insertDedup := fmt.Sprintf(
+		"INSERT INTO %s (id, aggregate_type, aggregate_id, event_type, payload, headers, dedup_key) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		table,
+	)
 	selectBase := fmt.Sprintf(
 		"SELECT %s FROM %s WHERE status = ?%s%s ORDER BY id ASC LIMIT ? FOR UPDATE SKIP LOCKED",
 		cols,
@@ -55,6 +60,7 @@ func newQueries(table string, retry, scoped bool) queries {
 
 	return queries{
 		insert:           insert,
+		insertDedup:      insertDedup,
 		selectPending:    selectBase,
 		updateFailureOne: updateFailureOne,
 		updateDeadOne:    updateDeadOne,

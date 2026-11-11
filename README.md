@@ -224,6 +224,27 @@ if err != nil {
 _, _ = producer, endpoint
 ```
 
+For duplicate admission, enable `Deduplication` on an unpartitioned schema and supply an opaque
+`DedupKey` of up to 512 bytes. A key is unique across the table while its row exists. An empty key
+disables deduplication and works with existing schemas. On a conflict, `Enqueue` returns a zero ID
+and `outbox.ErrDuplicate`; this does not prove that the existing payload is equal. The original MySQL
+error is also available through `errors.As`. Commit the surrounding transaction before acknowledging
+the input, including when the application treats a duplicate as successful admission.
+
+```go
+entry := outbox.Entry{
+	AggregateType: "endpoint-a",
+	EventType:     "delivery",
+	Payload:       []byte(`{"message":"hello"}`),
+	DedupKey:      "route-and-message-identity",
+}
+id, err := producer.Enqueue(ctx, tx, entry)
+if err != nil && !errors.Is(err, outbox.ErrDuplicate) {
+	return err
+}
+_ = id
+```
+
 ```sql
 CREATE TABLE IF NOT EXISTS outbox
 (

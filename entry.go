@@ -2,6 +2,8 @@ package outbox
 
 import "encoding/json"
 
+const maxDedupKeyBytes = 512
+
 // Entry describes a new outbox message to be persisted.
 type Entry struct {
 	// ID is optional. If zero, the store generator assigns a UUIDv7.
@@ -17,6 +19,9 @@ type Entry struct {
 	Payload json.RawMessage
 	// Headers is optional metadata (JSON object recommended).
 	Headers json.RawMessage
+	// DedupKey is an optional opaque identity, at most 512 bytes. Empty disables
+	// deduplication. Its lifetime equals the stored row's lifetime.
+	DedupKey string
 }
 
 // Validate checks required fields and JSON validity.
@@ -35,6 +40,9 @@ func ValidateEntryWithOptions(entry Entry, validatePayload, validateHeaders bool
 }
 
 func (e Entry) validate(validatePayload, validateHeaders bool) error {
+	if len(e.DedupKey) > maxDedupKeyBytes {
+		return errDedupKeyTooLong
+	}
 	if e.AggregateType == "" {
 		return ErrAggregateTypeRequired
 	}
