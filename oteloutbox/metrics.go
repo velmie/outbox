@@ -19,29 +19,57 @@ type Metrics struct {
 	duration  metric.Float64Histogram
 }
 
-// NewMetrics creates instruments for outbox relay outcomes.
+// NewMetrics creates instruments for outbox relay outcomes. Batch durations are
+// recorded in seconds with suggested explicit bucket boundaries from 5 ms to
+// 10 s. The meter provider can override the suggested aggregation.
 func NewMetrics(meter metric.Meter) (*Metrics, error) {
-	processed, err := meter.Int64Counter("outbox.processed")
+	processed, err := meter.Int64Counter(
+		"outbox.processed",
+		metric.WithUnit("{record}"),
+		metric.WithDescription("Number of processed records."),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("create outbox processed metric: %w", err)
 	}
-	failures, err := meter.Int64Counter("outbox.errors")
+	failures, err := meter.Int64Counter(
+		"outbox.errors",
+		metric.WithUnit("{record}"),
+		metric.WithDescription("Number of records with handler errors."),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("create outbox error metric: %w", err)
 	}
-	retries, err := meter.Int64Counter("outbox.retries")
+	retries, err := meter.Int64Counter(
+		"outbox.retries",
+		metric.WithUnit("{record}"),
+		metric.WithDescription("Number of records retried."),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("create outbox retry metric: %w", err)
 	}
-	dead, err := meter.Int64Counter("outbox.dead")
+	dead, err := meter.Int64Counter(
+		"outbox.dead",
+		metric.WithUnit("{record}"),
+		metric.WithDescription("Number of records marked dead by a permanent decision."),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("create outbox dead metric: %w", err)
 	}
-	pending, err := meter.Int64Gauge("outbox.pending")
+	pending, err := meter.Int64Gauge(
+		"outbox.pending",
+		metric.WithUnit("{record}"),
+		metric.WithDescription("Number of pending records."),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("create outbox pending metric: %w", err)
 	}
-	duration, err := meter.Float64Histogram("outbox.batch.duration", metric.WithUnit("s"))
+	duration, err := meter.Float64Histogram(
+		"outbox.batch.duration",
+		metric.WithUnit("s"),
+		metric.WithDescription("Time spent processing a batch."),
+		//nolint:mnd // Standard duration histogram boundaries in seconds.
+		metric.WithExplicitBucketBoundaries(0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("create outbox batch duration metric: %w", err)
 	}

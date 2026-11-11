@@ -27,6 +27,36 @@ and pass it to `outbox.WithMetrics`. It records processed, error, retry, dead,
 pending and batch duration measurements without event attributes. Retry
 exhaustion is counted as a retry and explicit permanent decisions as dead.
 
+```bash
+go get github.com/velmie/outbox/oteloutbox
+```
+
+Given an application-configured `metric.Meter`, an outbox consumer and a handler:
+
+```go
+func newRelay(meter metric.Meter, consumer outbox.Consumer, handler outbox.Handler) (*outbox.Relay, error) {
+    metrics, err := oteloutbox.NewMetrics(meter)
+    if err != nil {
+        return nil, err
+    }
+    return outbox.NewRelay(
+        consumer,
+        handler,
+        outbox.WithMetrics(metrics),
+        outbox.WithPendingInterval(5*time.Second),
+    ), nil
+}
+```
+
+Import `time`, `go.opentelemetry.io/otel/metric`, `github.com/velmie/outbox` and
+`github.com/velmie/outbox/oteloutbox`. Configure the meter provider with a reader
+and exporter in the application. Pending sampling requires a consumer that
+implements `outbox.PendingCounter` and a positive sampling interval.
+
+Counters and the pending gauge use the unit `{record}`. Batch duration uses
+seconds and suggests explicit buckets from 5 ms through 10 s; the provider can
+override the aggregation.
+
 ## Quick Start
 
 Create the outbox table before starting the service. Generate its DDL with `mysql.Schema` or
