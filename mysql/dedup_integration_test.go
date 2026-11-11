@@ -80,6 +80,7 @@ WHERE trx_mysql_thread_id = ? AND trx_state = 'LOCK WAIT'`, connectionID).Scan(&
 	var mysqlErr *mysqldriver.MySQLError
 	require.True(t, errors.As(result.err, &mysqlErr))
 	require.EqualValues(t, 1062, mysqlErr.Number)
+	require.Contains(t, mysqlErr.Message, "route")
 	var payload string
 	require.NoError(t, db.QueryRowContext(ctx, "SELECT payload FROM outbox WHERE id = ?", id).Scan(&payload))
 	require.JSONEq(t, `{"original":true}`, payload)

@@ -20,7 +20,8 @@ type Entry struct {
 	// Headers is optional metadata (JSON object recommended).
 	Headers json.RawMessage
 	// DedupKey is an optional opaque identity, at most 512 bytes. Empty disables
-	// deduplication. Its lifetime equals the stored row's lifetime.
+	// deduplication. Its lifetime equals the stored row's lifetime. Use a
+	// non-secret identity: a database conflict may include the key in its error.
 	DedupKey string
 }
 

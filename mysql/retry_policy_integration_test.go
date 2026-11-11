@@ -165,13 +165,21 @@ func TestRelayRetryHintPersistsWithGenericError(t *testing.T) {
 	require.Zero(t, metrics.dead)
 
 	var calls int
-	unscheduledRelay = outbox.NewRelay(unscheduled, outbox.HandlerFunc(func(_ context.Context, _ outbox.Record) error {
-		calls++
-		return outbox.RetryAfter(errors.New("temporary"), time.Second)
-	}))
+	logger := &workerLogger{}
+	unscheduledRelay = outbox.NewRelay(
+		unscheduled,
+		outbox.HandlerFunc(func(_ context.Context, _ outbox.Record) error {
+			calls++
+			return outbox.RetryAfter(errors.New("temporary"), time.Second)
+		}),
+		outbox.WithLogger(logger),
+	)
 	err = unscheduledRelay.Run(ctx)
 	require.ErrorContains(t, err, "retry delay requires retry scheduling (next_attempt_at)")
 	require.Equal(t, 1, calls)
+	require.Len(t, logger.errors, 1)
+	require.ErrorContains(t, logger.errors[0], unscheduledID.String())
+	require.ErrorContains(t, logger.errors[0], "retry delay requires retry scheduling (next_attempt_at)")
 	require.Zero(t, readRetryState(t, ctx, db, unscheduledID).attempts)
 
 	terminal := outbox.NewRelay(unscheduled, outbox.HandlerFunc(func(context.Context, outbox.Record) error {
@@ -283,3 +291,18 @@ func (m *committedCounts) AddProcessed(n int) { m.processed += n }
 func (m *committedCounts) AddErrors(n int)    { m.failures += n }
 func (m *committedCounts) AddRetries(n int)   { m.retries += n }
 func (m *committedCounts) AddDead(n int)      { m.dead += n }
+
+type workerLogger struct {
+	outbox.NopLogger
+	errors []error
+}
+
+func (l *workerLogger) Error(_ string, args ...any) {
+	for i := 0; i+1 < len(args); i += 2 {
+		if args[i] == "err" {
+			if err, ok := args[i+1].(error); ok {
+				l.errors = append(l.errors, err)
+			}
+		}
+	}
+}

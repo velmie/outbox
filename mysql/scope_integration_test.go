@@ -107,4 +107,19 @@ func TestScopedStoresIsolation(t *testing.T) {
 	require.EqualValues(t, 1, result.Processed)
 	status, _ = fetchStatus(t, ctx, db, idA)
 	require.Equal(t, outbox.StatusProcessed, status)
+	_, err = db.ExecContext(
+		ctx,
+		"UPDATE outbox SET status = ?, updated_at = UTC_TIMESTAMP(6) WHERE id = ?",
+		outbox.StatusDead,
+		idA,
+	)
+	require.NoError(t, err)
+	result, err = second.Cleanup(ctx, mysql.CleanupOptions{
+		Before:      time.Now().Add(time.Hour),
+		IncludeDead: true,
+	})
+	require.NoError(t, err)
+	require.Zero(t, result.Dead)
+	status, _ = fetchStatus(t, ctx, db, idA)
+	require.Equal(t, outbox.StatusDead, status)
 }

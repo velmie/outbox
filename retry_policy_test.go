@@ -114,3 +114,57 @@ func TestRelayDetailedPanicAndTimeout(t *testing.T) {
 		})
 	})
 }
+
+func TestRelayDetailedTimeoutPreservesHandlerOutcome(t *testing.T) {
+	cause := errors.New("receiver returned a different error")
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "different error",
+			err:  cause,
+		},
+		{
+			name: "success after deadline",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				batch := &fakeBatch{
+					records: []Record{{
+						ID: ID{1},
+					}},
+				}
+				relay := NewRelay(
+					staticConsumer{
+						batch: batch,
+					},
+					HandlerFunc(func(ctx context.Context, _ Record) error {
+						<-ctx.Done()
+						return test.err
+					}),
+					WithErrorDetails(),
+					WithHandlerTimeout(time.Second),
+				)
+				processed, err := relay.ProcessOnce(context.Background())
+				if err != nil || !processed {
+					t.Fatalf("process: processed=%t error=%v", processed, err)
+				}
+				if test.err == nil {
+					if len(batch.ackIDs) != 1 || len(batch.failures) != 0 {
+						t.Fatalf(
+							"expected acknowledgement, got %d acknowledgements and %d failures",
+							len(batch.ackIDs),
+							len(batch.failures),
+						)
+					}
+					return
+				}
+				if len(batch.failures) != 1 || !errors.Is(batch.failures[0].Err, cause) {
+					t.Fatalf("failure did not retain handler error: %v", batch.failures)
+				}
+			})
+		})
+	}
+}
