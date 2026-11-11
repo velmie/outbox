@@ -24,6 +24,7 @@ type RelayConfig struct {
 	Logger            Logger
 	Metrics           Metrics
 	FailureClassifier FailureClassifier
+	ErrorDetails      bool
 	// HandlerTimeout is a cooperative per-record context deadline. Relay waits
 	// for Handler.Handle to return and does not interrupt it.
 	HandlerTimeout  time.Duration
@@ -35,6 +36,15 @@ type RelayConfig struct {
 
 // RelayOption configures Relay behavior.
 type RelayOption func(*RelayConfig)
+
+// WithErrorDetails persists handler error text instead of generic summaries.
+// Error text and recovered panic values must not contain confidential data.
+// MySQL limits persisted text to 1024 Unicode code points.
+func WithErrorDetails() RelayOption {
+	return func(c *RelayConfig) {
+		c.ErrorDetails = true
+	}
+}
 
 // WithBatchSize sets the number of records processed per batch.
 func WithBatchSize(size int) RelayOption {

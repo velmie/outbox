@@ -8,6 +8,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	mysqldriver "github.com/go-sql-driver/mysql"
+
 	"github.com/velmie/outbox"
 )
 
@@ -48,6 +50,9 @@ func NewStore(db *sql.DB, opts ...Option) (*Store, error) {
 	if cfg.RetryDelay < 0 {
 		return nil, ErrRetryDelayInvalid
 	}
+	if cfg.RetryDelay > 0 && cfg.RetrySchedule != nil {
+		return nil, errRetryPolicyConflict
+	}
 
 	table, err := sanitizeTableName(cfg.Table)
 	if err != nil {
@@ -57,7 +62,7 @@ func NewStore(db *sql.DB, opts ...Option) (*Store, error) {
 	return &Store{
 		db:      db,
 		cfg:     cfg,
-		queries: newQueries(table, cfg.RetryDelay > 0),
+		queries: newQueries(table, cfg.retryScheduling(), cfg.AggregateType != ""),
 		table:   table,
 	}, nil
 }
@@ -76,6 +81,9 @@ func MustNewStore(db *sql.DB, opts ...Option) *Store {
 func (s *Store) Enqueue(ctx context.Context, exec Executor, entry outbox.Entry) (outbox.ID, error) {
 	if exec == nil {
 		return outbox.ID{}, ErrExecutorRequired
+	}
+	if s.cfg.AggregateType != "" && entry.AggregateType != s.cfg.AggregateType {
+		return outbox.ID{}, errAggregateTypeMismatch
 	}
 	if err := outbox.ValidateEntryWithOptions(entry, s.cfg.ValidatePayload, s.cfg.ValidateHeaders); err != nil {
 		return outbox.ID{}, err
@@ -102,17 +110,26 @@ func (s *Store) Enqueue(ctx context.Context, exec Executor, entry outbox.Entry) 
 		headers = entry.Headers
 	}
 
-	_, err := exec.ExecContext(
-		ctx,
-		s.queries.insert,
+	query := s.queries.insert
+	args := []any{
 		id,
 		entry.AggregateType,
 		entry.AggregateID,
 		entry.EventType,
 		entry.Payload,
 		headers,
-	)
+	}
+	if entry.DedupKey != "" {
+		query = s.queries.insertDedup
+		args = append(args, []byte(entry.DedupKey))
+	}
+	_, err := exec.ExecContext(ctx, query, args...)
 	if err != nil {
+		var mysqlErr *mysqldriver.MySQLError
+		if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 {
+			return outbox.ID{}, fmt.Errorf("outbox mysql: insert failed: %w: %w", outbox.ErrDuplicate, err)
+		}
+
 		return outbox.ID{}, fmt.Errorf("outbox mysql: insert failed: %w", err)
 	}
 
@@ -149,7 +166,8 @@ func (s *Store) Fetch(ctx context.Context, opts outbox.FetchOptions) (outbox.Bat
 // PendingCount returns the number of pending outbox rows, including delayed retries.
 func (s *Store) PendingCount(ctx context.Context) (int, error) {
 	var count int
-	if err := s.db.QueryRowContext(ctx, s.queries.countPending, outbox.StatusPending).Scan(&count); err != nil {
+	args := s.scopeArgs([]any{outbox.StatusPending})
+	if err := s.db.QueryRowContext(ctx, s.queries.countPending, args...).Scan(&count); err != nil {
 		return 0, fmt.Errorf("outbox mysql: pending count failed: %w", err)
 	}
 
@@ -157,7 +175,9 @@ func (s *Store) PendingCount(ctx context.Context) (int, error) {
 }
 
 func (s *Store) selectBatch(ctx context.Context, tx *sql.Tx, opts outbox.FetchOptions) ([]outbox.Record, error) {
-	rows, err := tx.QueryContext(ctx, s.queries.selectPending, outbox.StatusPending, opts.BatchSize)
+	args := s.scopeArgs([]any{outbox.StatusPending})
+	args = append(args, opts.BatchSize)
+	rows, err := tx.QueryContext(ctx, s.queries.selectPending, args...)
 	if err != nil {
 		return nil, fmt.Errorf("outbox mysql: select failed: %w", err)
 	}
@@ -209,6 +229,10 @@ func (s *Store) ack(ctx context.Context, tx *sql.Tx, ids []outbox.ID) error {
 	for _, id := range ids {
 		args = append(args, id)
 	}
+	if s.cfg.AggregateType != "" {
+		query += aggregateScopePredicate
+		args = append(args, s.cfg.AggregateType)
+	}
 
 	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 		return fmt.Errorf("outbox mysql: ack update failed: %w", err)
@@ -217,19 +241,32 @@ func (s *Store) ack(ctx context.Context, tx *sql.Tx, ids []outbox.ID) error {
 	return nil
 }
 
-func (s *Store) fail(ctx context.Context, tx *sql.Tx, failures []outbox.Failure) error {
+func (s *Store) fail(ctx context.Context, tx *sql.Tx, failures []outbox.Failure, attempts map[outbox.ID]int) error {
 	if len(failures) == 0 {
 		return nil
 	}
 
 	for _, failure := range failures {
+		attempt, found := attempts[failure.ID]
+		if !found {
+			continue
+		}
+		attempt++
+		delay, err := s.retryDelay(failure, attempt)
+		if err != nil {
+			return fmt.Errorf("outbox mysql: retry record %s: %w", failure.ID, err)
+		}
 		errText := truncateError(failure.Err)
 		args := []any{errText, s.cfg.MaxAttempts, outbox.StatusDead, outbox.StatusPending}
-		if s.cfg.RetryDelay > 0 {
-			micros := int64((s.cfg.RetryDelay-1)/time.Microsecond) + 1
+		if s.cfg.retryScheduling() {
+			var micros int64
+			if delay > 0 {
+				micros = int64((delay-1)/time.Microsecond) + 1
+			}
 			args = append(args, micros)
 		}
 		args = append(args, failure.ID)
+		args = s.scopeArgs(args)
 		if _, err := tx.ExecContext(
 			ctx,
 			s.queries.updateFailureOne,
@@ -237,9 +274,38 @@ func (s *Store) fail(ctx context.Context, tx *sql.Tx, failures []outbox.Failure)
 		); err != nil {
 			return fmt.Errorf("outbox mysql: fail update failed: %w", err)
 		}
+		attempts[failure.ID] = attempt
 	}
 
 	return nil
+}
+
+func (s *Store) retryDelay(failure outbox.Failure, attempt int) (time.Duration, error) {
+	if attempt >= s.cfg.MaxAttempts {
+		return 0, nil
+	}
+	if failure.RetryDelay < 0 {
+		return 0, errNegativeRetryHint
+	}
+	if !s.cfg.retryScheduling() {
+		if failure.RetryDelay > 0 {
+			return 0, errRetrySchedulingRequired
+		}
+
+		return 0, nil
+	}
+	delay := s.cfg.RetryDelay
+	if s.cfg.RetrySchedule != nil {
+		delay = s.cfg.RetrySchedule(attempt)
+		if delay < 0 {
+			return 0, errNegativeSchedule
+		}
+	}
+	if failure.RetryDelay > delay {
+		delay = failure.RetryDelay
+	}
+
+	return delay, nil
 }
 
 func (s *Store) dead(ctx context.Context, tx *sql.Tx, failures []outbox.Failure) error {
@@ -249,18 +315,21 @@ func (s *Store) dead(ctx context.Context, tx *sql.Tx, failures []outbox.Failure)
 
 	for _, failure := range failures {
 		errText := truncateError(failure.Err)
-		if _, err := tx.ExecContext(
-			ctx,
-			s.queries.updateDeadOne,
-			errText,
-			outbox.StatusDead,
-			failure.ID,
-		); err != nil {
+		args := s.scopeArgs([]any{errText, outbox.StatusDead, failure.ID})
+		if _, err := tx.ExecContext(ctx, s.queries.updateDeadOne, args...); err != nil {
 			return fmt.Errorf("outbox mysql: dead update failed: %w", err)
 		}
 	}
 
 	return nil
+}
+
+func (s *Store) scopeArgs(args []any) []any {
+	if s.cfg.AggregateType != "" {
+		args = append(args, s.cfg.AggregateType)
+	}
+
+	return args
 }
 
 func buildAckQuery(table string, count int) string {
@@ -290,7 +359,7 @@ func truncateError(err error) string {
 		return ""
 	}
 
-	msg := err.Error()
+	msg := string([]rune(err.Error()))
 	if utf8.RuneCountInString(msg) <= maxErrorLen {
 		return msg
 	}

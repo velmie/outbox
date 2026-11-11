@@ -9,9 +9,10 @@ import (
 )
 
 type batch struct {
-	tx      *sql.Tx
-	store   *Store
-	records []outbox.Record
+	tx       *sql.Tx
+	store    *Store
+	records  []outbox.Record
+	attempts map[outbox.ID]int
 }
 
 // Records returns the records fetched for this batch.
@@ -26,7 +27,14 @@ func (b *batch) Ack(ctx context.Context, ids []outbox.ID) error {
 
 // Fail records failures and updates retry state for each record.
 func (b *batch) Fail(ctx context.Context, failures []outbox.Failure) error {
-	return b.store.fail(ctx, b.tx, failures)
+	if b.attempts == nil {
+		b.attempts = make(map[outbox.ID]int, len(b.records))
+		for i := range b.records {
+			b.attempts[b.records[i].ID] = b.records[i].Attempts
+		}
+	}
+
+	return b.store.fail(ctx, b.tx, failures, b.attempts)
 }
 
 // Dead marks the provided records as dead.

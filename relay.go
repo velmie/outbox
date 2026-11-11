@@ -150,6 +150,8 @@ func (r *Relay) ProcessOnce(ctx context.Context) (bool, error) {
 		return false, err
 	}
 
+	r.maybeRecordPending(ctx)
+
 	return true, nil
 }
 
@@ -184,6 +186,7 @@ func (r *Relay) runWorker(stopCtx, workCtx context.Context) error {
 		if err := r.processBatch(workCtx, batch); err != nil {
 			return err
 		}
+		r.maybeRecordPending(stopCtx)
 	}
 }
 
@@ -270,12 +273,7 @@ func (r *Relay) collectBatchResults(ctx context.Context, records []Record) (batc
 				)
 			}
 
-			persistedErr := errHandlerFailed
-			if panicked {
-				persistedErr = errHandlerPanicked
-			} else if timedOut {
-				persistedErr = errHandlerTimedOut
-			}
+			persistedErr := r.failureDetail(handlerErr, panicked, timedOut)
 			r.recordFailure(ctx, record, handlerErr, persistedErr, &outcome)
 
 			continue
@@ -284,6 +282,20 @@ func (r *Relay) collectBatchResults(ctx context.Context, records []Record) (batc
 	}
 
 	return outcome, nil
+}
+
+func (r *Relay) failureDetail(err error, panicked, timedOut bool) error {
+	if r.cfg.ErrorDetails {
+		return err
+	}
+	if panicked {
+		return errHandlerPanicked
+	}
+	if timedOut {
+		return errHandlerTimedOut
+	}
+
+	return errHandlerFailed
 }
 
 func (r *Relay) invokeHandler(ctx context.Context, record Record) (panicked bool, err error) {
@@ -309,12 +321,20 @@ func (r *Relay) recordFailure(
 	}
 
 	action := r.cfg.FailureClassifier(ctx, record, handlerErr)
+	failure := Failure{
+		ID:  record.ID,
+		Err: persistedErr,
+	}
+	var retry *retryAfterError
+	if errors.As(handlerErr, &retry) {
+		failure.RetryDelay = retry.delay
+	}
 	if action == FailureDead {
-		outcome.dead = append(outcome.dead, Failure{ID: record.ID, Err: persistedErr})
+		outcome.dead = append(outcome.dead, failure)
 
 		return
 	}
-	outcome.failed = append(outcome.failed, Failure{ID: record.ID, Err: persistedErr})
+	outcome.failed = append(outcome.failed, failure)
 }
 
 func (r *Relay) applyBatchResults(ctx context.Context, batch Batch, outcome batchOutcome) error {

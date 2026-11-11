@@ -19,6 +19,49 @@ go get github.com/velmie/outbox/mysql
 
 Install `github.com/velmie/outbox/mysql` when you use the MySQL adapter.
 
+## OpenTelemetry metrics
+
+Use `github.com/velmie/outbox/oteloutbox` to record relay metrics with an
+OpenTelemetry meter. Construct the adapter with `oteloutbox.NewMetrics` and pass
+it to `outbox.WithMetrics`. It records processed, error, retry, dead, pending and
+batch duration measurements with optional fixed attributes. Retry
+exhaustion is counted as a retry and explicit permanent decisions as dead.
+
+```bash
+go get github.com/velmie/outbox/oteloutbox
+```
+
+Given an application-configured `metric.Meter`, an outbox consumer and a handler:
+
+```go
+func newRelay(meter metric.Meter, consumer outbox.Consumer, handler outbox.Handler) (*outbox.Relay, error) {
+    metrics, err := oteloutbox.NewMetrics(meter, attribute.String("endpoint", "orders"))
+    if err != nil {
+        return nil, err
+    }
+    return outbox.NewRelay(
+        consumer,
+        handler,
+        outbox.WithMetrics(metrics),
+        outbox.WithPendingInterval(5*time.Second),
+    ), nil
+}
+```
+
+Import `time`, `go.opentelemetry.io/otel/attribute`, `go.opentelemetry.io/otel/metric`, `github.com/velmie/outbox` and
+`github.com/velmie/outbox/oteloutbox`. Configure the meter provider with a reader
+and exporter in the application. Pending sampling requires a consumer that
+implements `outbox.PendingCounter` and a positive sampling interval.
+
+Attributes apply to every measurement from the adapter. Use bounded identifiers
+to limit metric cardinality. Adapters with identical attribute sets share a
+metric series, including the pending gauge. Omit attributes with
+`oteloutbox.NewMetrics(meter)` when no distinction is needed.
+
+Counters and the pending gauge use the unit `{record}`. Batch duration uses
+seconds and suggests explicit buckets from 5 ms through 10 s; the provider can
+override the aggregation.
+
 ## Quick Start
 
 Create the outbox table before starting the service. Generate its DDL with `mysql.Schema` or
@@ -153,6 +196,36 @@ The existing schema helpers and stores without the option retain immediate retry
 the additional column. A zero delay disables scheduling; negative values are rejected. Positive durations round
 up to the next microsecond, matching MySQL's timestamp precision.
 
+For attempt-dependent delays, use a concurrency-safe schedule. The argument is the just-failed
+attempt, starting at one. A handler can add a minimum delay with `outbox.RetryAfter`:
+
+```go
+store, err := mysql.NewStore(db, mysql.WithRetrySchedule(func(attempt int) time.Duration {
+	return time.Duration(attempt) * time.Second
+}))
+if err != nil {
+	return err
+}
+relay := outbox.NewRelay(store, outbox.HandlerFunc(func(ctx context.Context, record outbox.Record) error {
+	if err := deliver(ctx, record); err != nil {
+		return outbox.RetryAfter(err, 30*time.Second)
+	}
+	return nil
+}))
+_ = relay
+```
+
+The longer of the configured delay and the hint applies. A zero-returning schedule enables hints
+without a base delay. A positive fixed delay and a schedule cannot be combined. A positive hint for a
+retryable failure without scheduling rolls back the batch and returns an error. `Run` stops its workers;
+`ProcessOnce` returns the error to its caller. A dead-letter classification or exhausted attempt limit
+takes precedence over the hint.
+
+By default, the relay persists generic error summaries. `outbox.WithErrorDetails()` opts in to persisting
+the handler error text and recovered panic values. Enable it only when those values are safe to store.
+MySQL stores at most 1024 Unicode code points and requires `utf8mb4` for full Unicode. Callbacks and
+classifiers still receive the original error.
+
 With scheduling enabled, `Batch.Fail` writes `next_attempt_at` together with the attempt count, error, and status
 in the batch transaction. The deadline uses the database's UTC time when the failure update executes; time spent
 before the transaction commits counts toward the delay. Each consumer fetches only pending rows with no deadline
@@ -176,17 +249,108 @@ ALTER TABLE outbox
 ```
 
 Existing rows have no deadline and remain eligible. Stop consumers that ignore deadlines before any consumer starts
-scheduling retries on that table, and configure every replacement consumer with a positive retry delay. A legacy
+scheduling retries on that table, and configure every replacement consumer with scheduling enabled. A legacy
 consumer, including a new store with scheduling disabled, would fetch delayed rows immediately. Producers can
 continue using the existing enqueue contract. Missing scheduling schema causes a database error rather than a
 fallback to immediate retries. `RetrySchema` creates a non-partitioned JSON table; existing binary or partitioned
 tables can opt in through the explicit migration while retaining their payload and partition definitions.
+
+## Requeue dead records
+
+Requeue performs one bounded update of dead rows. Select by IDs, aggregate type, event type, or a
+combination. Selectors intersect with the store scope. At least one selector and a positive limit are
+required. The operation resets attempts, error and processed time, preserving the ID, payload, headers,
+deduplication key and creation time. Enable scheduling on the store to clear retry deadlines too.
+
+```go
+count, err := endpoint.Requeue(ctx, mysql.RequeueOptions{
+	EventType: "delivery",
+	Limit:     100,
+})
+if err != nil {
+	return err
+}
+_ = count
+```
+
+`Requeue` reports confirmed affected rows. An error does not prove that the database changed no rows.
+Check the affected records before deciding whether to run the operation again. Requeued deliveries can
+be delivered more than once, with the same ID.
+
+The `outbox-requeue` command runs one batch and prints the affected count. Set `OUTBOX_DSN` through a
+protected environment or secret manager. For example:
+
+```sh
+outbox-requeue -table outbox -aggregate-type endpoint-a -event-type delivery -limit 100 -retry-scheduling
+```
+
+Use repeated `-id` flags to select UUIDs, including previously stored UUID versions. `-retry-scheduling`
+clears `next_attempt_at` and requires that column. The default limit is 1000. Invalid arguments exit with
+status 2, execution failures with status 1, and success with status 0. The command does not retry mutations.
 
 ## MySQL schema
 
 Generate with `mysql.Schema("outbox")` or use the template below. Apply generated DDL through a controlled migration;
 `CREATE TABLE IF NOT EXISTS` does not convert an existing table to InnoDB or change its partition layout.
 The schema is tuned for UUID v7 + polling, with `created_ts` used as the partition key for retention.
+
+Use `SchemaWithOptions` to combine optional payload, retry, index, and partition capabilities:
+
+```go
+ddl, err := mysql.SchemaWithOptions("outbox", mysql.SchemaOptions{
+	BinaryPayload:      true,
+	Retry:              true,
+	AggregateTypeIndex: true,
+})
+if err != nil {
+	return err
+}
+// Apply ddl in a migration before starting consumers.
+```
+
+Binary payloads require `mysql.WithValidatePayload(false)` on the store. Headers remain JSON.
+`Deduplication` adds a nullable unique key and cannot be combined with partitions, because the key must
+remain unique across the whole table. The helper generates DDL only; it does not alter existing tables.
+
+For independent delivery queues in one table, create an unscoped producer and a scoped store for each
+consumer. A scoped store fetches, settles, counts, and cleans up only rows for its aggregate type. It rejects
+entries with another aggregate type. Add `AggregateTypeIndex` to the schema for these queries and stop any
+unscoped consumers before relying on isolation. Database collation determines query comparisons.
+
+```go
+producer, err := mysql.NewStore(db)
+if err != nil {
+	return err
+}
+endpoint, err := mysql.NewStore(db, mysql.WithAggregateType("endpoint-a"))
+if err != nil {
+	return err
+}
+// Use producer to enqueue and endpoint as the relay's consumer.
+_, _ = producer, endpoint
+```
+
+For duplicate admission, enable `Deduplication` on an unpartitioned schema and supply an opaque
+`DedupKey` of up to 512 bytes. A key is unique across the table while its row exists. An empty key
+disables deduplication and works with existing schemas. On a conflict, `Enqueue` returns a zero ID
+and `outbox.ErrDuplicate`; this does not prove that the existing payload is equal. The original MySQL
+error is also available through `errors.As`. Commit the surrounding transaction before acknowledging
+the input, including when the application treats a duplicate as successful admission. Use a non-secret
+key: a MySQL duplicate-key error can contain the conflicting value.
+
+```go
+entry := outbox.Entry{
+	AggregateType: "endpoint-a",
+	EventType:     "delivery",
+	Payload:       []byte(`{"message":"hello"}`),
+	DedupKey:      "route-and-message-identity",
+}
+id, err := producer.Enqueue(ctx, tx, entry)
+if err != nil && !errors.Is(err, outbox.ErrDuplicate) {
+	return err
+}
+_ = id
+```
 
 ```sql
 CREATE TABLE IF NOT EXISTS outbox
@@ -566,8 +730,8 @@ FOR UPDATE SKIP LOCKED;
 - Keep handler processing short; avoid network retries inside the DB transaction.
 - `WithHandlerTimeout` gives each call a cooperative context deadline. The relay calls `Handle` synchronously and
   waits for it to return, so the handler must observe `ctx` to finish near the deadline.
-- Relay-created failure details for returned errors, recovered handler panics, and errors returned after an elapsed
-  handler deadline are limited to `outbox handler failed`, `outbox handler panicked`, and `outbox handler timed out`.
+- By default, relay-created failure details for returned errors, recovered handler panics, and errors returned after an
+  elapsed handler deadline use generic summaries. `WithErrorDetails` enables the original text and panic values.
   Callbacks and classifiers receive the original error or a recovered panic with its value and cause.
 - `WithShutdownTimeout` controls the shared drain allowance. It defaults to five seconds. Zero or a negative
   duration cancels admitted work immediately.
@@ -688,8 +852,13 @@ Reproduce: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Docs
 
+The [delivery queue example](examples/delivery/README.md) exercises JetStream admission, MySQL, and HTTP
+delivery against test-owned dependencies.
+
 See [docs/guide.md](docs/guide.md) for architecture, tuning, failure handling, cleanup, and extension notes.
 See [docs/benchmarks.md](docs/benchmarks.md) for the research harness and plotting workflow.
+See [docs/migration-v0.6.0.md](docs/migration-v0.6.0.md) and [docs/release-v0.6.0.md](docs/release-v0.6.0.md)
+for the delivery queue capabilities and upgrade procedure.
 See [docs/migration-v0.3.0.md](docs/migration-v0.3.0.md) to upgrade from v0.2.0 and enable durable retry delay.
 See [docs/release-v0.5.0.md](docs/release-v0.5.0.md) for the v0.5.0 release notes.
 See [docs/release-v0.4.0.md](docs/release-v0.4.0.md) for the v0.4.0 release notes.
@@ -703,20 +872,22 @@ See [docs/release-v0.2.0.md](docs/release-v0.2.0.md) for the v0.2.0 release note
 for module in . mysql cmd; do
   (cd "$module" && go test -race ./... && go vet ./...)
 done
+(cd examples/delivery && GOWORK=off go test -race ./... && GOWORK=off go vet ./...)
 
 (cd mysql && go test -count=1 -tags=integration -timeout 12m ./...)
 (cd cmd && go test -count=1 -tags=integration -timeout 12m ./...)
+(cd examples/delivery && GOWORK=off go test -count=1 -tags=integration -timeout 12m ./...)
 ```
 
-The committed `go.work` makes the nested modules use the current checkout. Integration tests use Testcontainers and
-require a working Docker daemon; container startup failures fail the suite.
-CLI integration tests in `cmd/outbox-cleanup` and `cmd/outbox-partitions` build the binaries and run them in a container against a real MySQL container.
+The committed `go.work` connects the root, MySQL, and command modules. The separate example module resolves
+released library versions. Integration tests use Testcontainers and require a working Docker daemon; container
+startup failures fail the suite. CLI integration tests build the binaries and run them against real MySQL.
 
 Run only the CLI integration tests:
 
 ```bash
 cd cmd
-go test -tags=integration -timeout 5m ./outbox-cleanup ./outbox-partitions
+go test -tags=integration -timeout 5m ./outbox-cleanup ./outbox-partitions ./outbox-requeue
 ```
 
 ## Lint
@@ -727,11 +898,12 @@ repo_root="$(pwd)"
 for module in . mysql cmd; do
   (cd "$module" && golangci-lint run --config "$repo_root/.golangci.yml" ./...)
 done
+(cd examples/delivery && GOWORK=off golangci-lint run --config "$repo_root/.golangci.yml" ./...)
 ```
 
-The complete gate requires Go 1.26.10, Git, tar, zip, Docker, golangci-lint 2.12.2, govulncheck 1.7.0, and Trivy 0.74.0.
-Run `./scripts/verify.sh` for the root, `mysql`, and `cmd` release gate. It verifies the v0.5.0 candidate module graph
-without `go.work`, then runs integration tests, `govulncheck`, and Trivy.
+The complete gate requires Go 1.26.11, Git, tar, zip, Docker, golangci-lint 2.12.2, govulncheck 1.7.0, and Trivy 0.74.0.
+Run `./scripts/verify.sh` for the library, commands, and delivery example. It verifies the v0.6.0 candidate module
+graph without `go.work`, then runs integration tests, `govulncheck`, and Trivy.
 
 ## License
 

@@ -14,8 +14,10 @@ const (
 // Config defines MySQL store behavior.
 type Config struct {
 	Table              string
+	AggregateType      string
 	MaxAttempts        int
 	RetryDelay         time.Duration
+	RetrySchedule      func(attempt int) time.Duration
 	Clock              outbox.Clock
 	Generator          outbox.IDGenerator
 	ValidateJSON       bool
@@ -26,8 +28,26 @@ type Config struct {
 	validateHeadersSet bool
 }
 
+// WithAggregateType restricts store operations to one aggregate type.
+// Empty preserves the existing unscoped behavior.
+// Enqueue requires an exact match; database comparisons follow column collation.
+func WithAggregateType(value string) Option {
+	return func(c *Config) {
+		c.AggregateType = value
+	}
+}
+
 // Option configures the MySQL store.
 type Option func(*Config)
+
+// WithRetrySchedule enables durable scheduling through next_attempt_at.
+// attempt is the just-failed attempt, starting at 1. The schedule must be
+// nonnil, concurrency-safe and return a nonnegative delay.
+func WithRetrySchedule(schedule func(attempt int) time.Duration) Option {
+	return func(c *Config) {
+		c.RetrySchedule = schedule
+	}
+}
 
 // WithTable sets the outbox table name.
 func WithTable(name string) Option {
@@ -95,6 +115,10 @@ func WithValidateHeaders(enabled bool) Option {
 		c.ValidateHeaders = enabled
 		c.validateHeadersSet = true
 	}
+}
+
+func (c Config) retryScheduling() bool {
+	return c.RetryDelay > 0 || c.RetrySchedule != nil
 }
 
 func (c Config) withDefaults() Config {

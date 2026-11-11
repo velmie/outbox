@@ -2,10 +2,9 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODULES=(. mysql cmd)
+MODULES=(. mysql cmd oteloutbox examples/delivery)
 
-export GOTOOLCHAIN=go1.26.10
-export GOWORK="${ROOT_DIR}/go.work"
+export GOTOOLCHAIN=go1.26.11
 
 for command in go git tar zip docker golangci-lint govulncheck trivy; do
   if ! command -v "${command}" >/dev/null 2>&1; then
@@ -14,8 +13,8 @@ for command in go git tar zip docker golangci-lint govulncheck trivy; do
   fi
 done
 
-if [[ "$(go env GOVERSION)" != "go1.26.10" ]]; then
-  echo "release gate requires Go 1.26.10" >&2
+if [[ "$(go env GOVERSION)" != "go1.26.11" ]]; then
+  echo "release gate requires Go 1.26.11" >&2
   exit 1
 fi
 if ! golangci-lint version | grep -Fq "version 2.12.2"; then
@@ -32,6 +31,18 @@ if ! trivy --version | grep -Fq "Version: 0.74.0"; then
 fi
 
 docker info >/dev/null 2>&1
+
+workspace_dir="$(mktemp -d)"
+trap 'rm -rf -- "${workspace_dir}"' EXIT
+(
+  cd "${workspace_dir}"
+  GOWORK=off go work init \
+    "${ROOT_DIR}" "${ROOT_DIR}/mysql" "${ROOT_DIR}/cmd" "${ROOT_DIR}/oteloutbox" "${ROOT_DIR}/examples/delivery"
+)
+export GOWORK="${workspace_dir}/go.work"
+go work edit -go=1.26.11 \
+  -replace="github.com/velmie/outbox@v0.6.0=${ROOT_DIR}" \
+  -replace="github.com/velmie/outbox/mysql@v0.6.0=${ROOT_DIR}/mysql"
 
 echo "==> release module graph"
 bash "${ROOT_DIR}/scripts/verify-release-modules.sh"
@@ -53,6 +64,9 @@ echo "==> mysql: integration"
 
 echo "==> cmd: integration"
 (cd "${ROOT_DIR}/cmd" && go test -count=1 -mod=readonly -tags=integration -timeout 12m ./...)
+
+echo "==> delivery example: integration"
+(cd "${ROOT_DIR}/examples/delivery" && go test -count=1 -mod=readonly -tags=integration -timeout 12m ./...)
 
 echo "==> repository: HIGH/CRITICAL Go dependency vulnerabilities"
 trivy fs --scanners vuln --severity HIGH,CRITICAL --exit-code 1 "${ROOT_DIR}"

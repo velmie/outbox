@@ -66,7 +66,7 @@ func TestStoreEnqueueGeneratesID(t *testing.T) {
 	gen := &fixedGenerator{id: validTestID(t, 1)}
 	store := &Store{
 		cfg:     Config{Generator: gen}.withDefaults(),
-		queries: newQueries("outbox", false),
+		queries: newQueries("outbox", false, false),
 		table:   "outbox",
 	}
 	entry := outbox.Entry{
@@ -105,7 +105,7 @@ func TestStoreEnqueueSkipsPayloadValidation(t *testing.T) {
 			ValidateHeaders:    true,
 			validateHeadersSet: true,
 		}.withDefaults(),
-		queries: newQueries("outbox", false),
+		queries: newQueries("outbox", false, false),
 		table:   "outbox",
 	}
 	entry := outbox.Entry{
@@ -141,7 +141,7 @@ func TestStoreEnqueueRejectsInvalidCallerIDsBeforePersistence(t *testing.T) {
 			gen := &fixedGenerator{id: valid}
 			store := &Store{
 				cfg:     Config{Generator: gen}.withDefaults(),
-				queries: newQueries("outbox", false),
+				queries: newQueries("outbox", false, false),
 				table:   "outbox",
 			}
 			fakeExec := &fakeExecutor{}
@@ -183,7 +183,7 @@ func TestStoreEnqueueRejectsInvalidGeneratedIDsBeforePersistence(t *testing.T) {
 			gen := &fixedGenerator{id: test.id}
 			store := &Store{
 				cfg:     Config{Generator: gen}.withDefaults(),
-				queries: newQueries("outbox", false),
+				queries: newQueries("outbox", false, false),
 				table:   "outbox",
 			}
 			fakeExec := &fakeExecutor{}

@@ -41,21 +41,56 @@ type Partition struct {
 	LessThan string
 }
 
+// SchemaOptions selects optional table capabilities. Its zero value produces
+// the base JSON schema.
+type SchemaOptions struct {
+	BinaryPayload      bool
+	Retry              bool
+	AggregateTypeIndex bool
+	Deduplication      bool
+	Partitions         []Partition
+}
+
+// SchemaWithOptions returns migration DDL without executing SQL.
+func SchemaWithOptions(table string, opts SchemaOptions) (string, error) {
+	if opts.Deduplication && len(opts.Partitions) > 0 {
+		return "", errDeduplicationPartitioned
+	}
+	clause := ""
+	if len(opts.Partitions) > 0 {
+		var err error
+		clause, err = buildPartitionClause(opts.Partitions)
+		if err != nil {
+			return "", err
+		}
+	}
+	payload := payloadJSON
+	if opts.BinaryPayload {
+		payload = payloadBinary
+	}
+
+	return buildSchema(table, payload, clause, opts)
+}
+
 // Schema returns the base schema for an outbox table (without partitioning).
 func Schema(table string) (string, error) {
-	return buildSchema(table, payloadJSON, "", false)
+	return SchemaWithOptions(table, SchemaOptions{})
 }
 
 // RetrySchema returns a non-partitioned JSON schema supporting WithRetryDelay.
 // A null deadline makes a new row immediately eligible. Apply the schema through
 // migrations; CREATE TABLE IF NOT EXISTS does not upgrade an existing table.
 func RetrySchema(table string) (string, error) {
-	return buildSchema(table, payloadJSON, "", true)
+	return SchemaWithOptions(table, SchemaOptions{
+		Retry: true,
+	})
 }
 
 // SchemaBinary returns a schema with LONGBLOB payload and JSON headers.
 func SchemaBinary(table string) (string, error) {
-	return buildSchema(table, payloadBinary, "", false)
+	return SchemaWithOptions(table, SchemaOptions{
+		BinaryPayload: true,
+	})
 }
 
 // PartitionedSchema returns a schema with RANGE partitions on created_ts.
@@ -65,7 +100,7 @@ func PartitionedSchema(table string, partitions []Partition) (string, error) {
 		return "", err
 	}
 
-	return buildSchema(table, payloadJSON, clause, false)
+	return buildSchema(table, payloadJSON, clause, SchemaOptions{})
 }
 
 // PartitionedSchemaBinary returns a schema with LONGBLOB payload and RANGE partitions on created_ts.
@@ -75,18 +110,29 @@ func PartitionedSchemaBinary(table string, partitions []Partition) (string, erro
 		return "", err
 	}
 
-	return buildSchema(table, payloadBinary, clause, false)
+	return buildSchema(table, payloadBinary, clause, SchemaOptions{})
 }
 
-func buildSchema(table, payloadType, partitionClause string, retry bool) (string, error) {
+func buildSchema(table, payloadType, partitionClause string, opts SchemaOptions) (string, error) {
 	name, err := sanitizeTableName(table)
 	if err != nil {
 		return "", err
 	}
 
 	column, index := "", ""
-	if retry {
+	if opts.Retry {
 		column, index = retryColumn, retryIndex
+	}
+	if opts.Deduplication {
+		column += "\tdedup_key VARBINARY(512) NULL,\n"
+		index += ",\n\tUNIQUE KEY uq_dedup_key (dedup_key)"
+	}
+	if opts.AggregateTypeIndex {
+		if opts.Retry {
+			index += ",\n\tINDEX idx_aggregate_type_status_next_attempt_id (aggregate_type, status, next_attempt_at, id)"
+		} else {
+			index += ",\n\tINDEX idx_aggregate_type_status_id (aggregate_type, status, id)"
+		}
 	}
 
 	return fmt.Sprintf(schemaTemplate, name, payloadType, headersJSON, column, index, partitionClause), nil
