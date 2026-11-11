@@ -188,6 +188,24 @@ Generate with `mysql.Schema("outbox")` or use the template below. Apply generate
 `CREATE TABLE IF NOT EXISTS` does not convert an existing table to InnoDB or change its partition layout.
 The schema is tuned for UUID v7 + polling, with `created_ts` used as the partition key for retention.
 
+Use `SchemaWithOptions` to combine optional payload, retry, index, and partition capabilities:
+
+```go
+ddl, err := mysql.SchemaWithOptions("outbox", mysql.SchemaOptions{
+	BinaryPayload:      true,
+	Retry:              true,
+	AggregateTypeIndex: true,
+})
+if err != nil {
+	return err
+}
+// Apply ddl in a migration before starting consumers.
+```
+
+Binary payloads require `mysql.WithValidatePayload(false)` on the store. Headers remain JSON.
+`Deduplication` adds a nullable unique key and cannot be combined with partitions, because the key must
+remain unique across the whole table. The helper generates DDL only; it does not alter existing tables.
+
 ```sql
 CREATE TABLE IF NOT EXISTS outbox
 (
