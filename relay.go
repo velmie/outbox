@@ -150,6 +150,8 @@ func (r *Relay) ProcessOnce(ctx context.Context) (bool, error) {
 		return false, err
 	}
 
+	r.maybeRecordPending(ctx)
+
 	return true, nil
 }
 
@@ -184,6 +186,7 @@ func (r *Relay) runWorker(stopCtx, workCtx context.Context) error {
 		if err := r.processBatch(workCtx, batch); err != nil {
 			return err
 		}
+		r.maybeRecordPending(stopCtx)
 	}
 }
 
