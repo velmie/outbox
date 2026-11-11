@@ -5,6 +5,10 @@ import "errors"
 var (
 	errDeduplicationPartitioned = errors.New("outbox mysql: deduplication cannot be combined with partitions")
 	errAggregateTypeMismatch    = errors.New("outbox mysql: entry aggregate type does not match store scope")
+	errRetryPolicyConflict      = errors.New("outbox mysql: retry schedule and positive retry delay cannot be combined")
+	errRetrySchedulingRequired  = errors.New("retry delay requires retry scheduling (next_attempt_at)")
+	errNegativeRetryHint        = errors.New("retry delay hint must be nonnegative")
+	errNegativeSchedule         = errors.New("retry schedule must return a nonnegative delay")
 	// ErrRetryDelayInvalid is returned when the retry delay is negative.
 	ErrRetryDelayInvalid = errors.New("outbox mysql: retry delay must be non-negative")
 	// ErrDBRequired is returned when a nil *sql.DB is provided.

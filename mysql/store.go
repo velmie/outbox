@@ -50,6 +50,9 @@ func NewStore(db *sql.DB, opts ...Option) (*Store, error) {
 	if cfg.RetryDelay < 0 {
 		return nil, ErrRetryDelayInvalid
 	}
+	if cfg.RetryDelay > 0 && cfg.RetrySchedule != nil {
+		return nil, errRetryPolicyConflict
+	}
 
 	table, err := sanitizeTableName(cfg.Table)
 	if err != nil {
@@ -59,7 +62,7 @@ func NewStore(db *sql.DB, opts ...Option) (*Store, error) {
 	return &Store{
 		db:      db,
 		cfg:     cfg,
-		queries: newQueries(table, cfg.RetryDelay > 0, cfg.AggregateType != ""),
+		queries: newQueries(table, cfg.retryScheduling(), cfg.AggregateType != ""),
 		table:   table,
 	}, nil
 }
@@ -238,16 +241,28 @@ func (s *Store) ack(ctx context.Context, tx *sql.Tx, ids []outbox.ID) error {
 	return nil
 }
 
-func (s *Store) fail(ctx context.Context, tx *sql.Tx, failures []outbox.Failure) error {
+func (s *Store) fail(ctx context.Context, tx *sql.Tx, failures []outbox.Failure, attempts map[outbox.ID]int) error {
 	if len(failures) == 0 {
 		return nil
 	}
 
 	for _, failure := range failures {
+		attempt, found := attempts[failure.ID]
+		if !found {
+			continue
+		}
+		attempt++
+		delay, err := s.retryDelay(failure, attempt)
+		if err != nil {
+			return fmt.Errorf("outbox mysql: retry record %s: %w", failure.ID, err)
+		}
 		errText := truncateError(failure.Err)
 		args := []any{errText, s.cfg.MaxAttempts, outbox.StatusDead, outbox.StatusPending}
-		if s.cfg.RetryDelay > 0 {
-			micros := int64((s.cfg.RetryDelay-1)/time.Microsecond) + 1
+		if s.cfg.retryScheduling() {
+			var micros int64
+			if delay > 0 {
+				micros = int64((delay-1)/time.Microsecond) + 1
+			}
 			args = append(args, micros)
 		}
 		args = append(args, failure.ID)
@@ -259,9 +274,38 @@ func (s *Store) fail(ctx context.Context, tx *sql.Tx, failures []outbox.Failure)
 		); err != nil {
 			return fmt.Errorf("outbox mysql: fail update failed: %w", err)
 		}
+		attempts[failure.ID] = attempt
 	}
 
 	return nil
+}
+
+func (s *Store) retryDelay(failure outbox.Failure, attempt int) (time.Duration, error) {
+	if attempt >= s.cfg.MaxAttempts {
+		return 0, nil
+	}
+	if failure.RetryDelay < 0 {
+		return 0, errNegativeRetryHint
+	}
+	if !s.cfg.retryScheduling() {
+		if failure.RetryDelay > 0 {
+			return 0, errRetrySchedulingRequired
+		}
+
+		return 0, nil
+	}
+	delay := s.cfg.RetryDelay
+	if s.cfg.RetrySchedule != nil {
+		delay = s.cfg.RetrySchedule(attempt)
+		if delay < 0 {
+			return 0, errNegativeSchedule
+		}
+	}
+	if failure.RetryDelay > delay {
+		delay = failure.RetryDelay
+	}
+
+	return delay, nil
 }
 
 func (s *Store) dead(ctx context.Context, tx *sql.Tx, failures []outbox.Failure) error {
@@ -315,7 +359,7 @@ func truncateError(err error) string {
 		return ""
 	}
 
-	msg := err.Error()
+	msg := string([]rune(err.Error()))
 	if utf8.RuneCountInString(msg) <= maxErrorLen {
 		return msg
 	}

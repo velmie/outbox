@@ -153,6 +153,36 @@ The existing schema helpers and stores without the option retain immediate retry
 the additional column. A zero delay disables scheduling; negative values are rejected. Positive durations round
 up to the next microsecond, matching MySQL's timestamp precision.
 
+For attempt-dependent delays, use a concurrency-safe schedule. The argument is the just-failed
+attempt, starting at one. A handler can add a minimum delay with `outbox.RetryAfter`:
+
+```go
+store, err := mysql.NewStore(db, mysql.WithRetrySchedule(func(attempt int) time.Duration {
+	return time.Duration(attempt) * time.Second
+}))
+if err != nil {
+	return err
+}
+relay := outbox.NewRelay(store, outbox.HandlerFunc(func(ctx context.Context, record outbox.Record) error {
+	if err := deliver(ctx, record); err != nil {
+		return outbox.RetryAfter(err, 30*time.Second)
+	}
+	return nil
+}))
+_ = relay
+```
+
+The longer of the configured delay and the hint applies. A zero-returning schedule enables hints
+without a base delay. A positive fixed delay and a schedule cannot be combined. A positive hint for a
+retryable failure without scheduling rolls back the batch and returns an error. `Run` stops its workers;
+`ProcessOnce` returns the error to its caller. A dead-letter classification or exhausted attempt limit
+takes precedence over the hint.
+
+By default, the relay persists generic error summaries. `outbox.WithErrorDetails()` opts in to persisting
+the handler error text and recovered panic values. Enable it only when those values are safe to store.
+MySQL stores at most 1024 Unicode code points and requires `utf8mb4` for full Unicode. Callbacks and
+classifiers still receive the original error.
+
 With scheduling enabled, `Batch.Fail` writes `next_attempt_at` together with the attempt count, error, and status
 in the batch transaction. The deadline uses the database's UTC time when the failure update executes; time spent
 before the transaction commits counts toward the delay. Each consumer fetches only pending rows with no deadline
@@ -176,7 +206,7 @@ ALTER TABLE outbox
 ```
 
 Existing rows have no deadline and remain eligible. Stop consumers that ignore deadlines before any consumer starts
-scheduling retries on that table, and configure every replacement consumer with a positive retry delay. A legacy
+scheduling retries on that table, and configure every replacement consumer with scheduling enabled. A legacy
 consumer, including a new store with scheduling disabled, would fetch delayed rows immediately. Producers can
 continue using the existing enqueue contract. Missing scheduling schema causes a database error rather than a
 fallback to immediate retries. `RetrySchema` creates a non-partitioned JSON table; existing binary or partitioned
@@ -623,8 +653,8 @@ FOR UPDATE SKIP LOCKED;
 - Keep handler processing short; avoid network retries inside the DB transaction.
 - `WithHandlerTimeout` gives each call a cooperative context deadline. The relay calls `Handle` synchronously and
   waits for it to return, so the handler must observe `ctx` to finish near the deadline.
-- Relay-created failure details for returned errors, recovered handler panics, and errors returned after an elapsed
-  handler deadline are limited to `outbox handler failed`, `outbox handler panicked`, and `outbox handler timed out`.
+- By default, relay-created failure details for returned errors, recovered handler panics, and errors returned after an
+  elapsed handler deadline use generic summaries. `WithErrorDetails` enables the original text and panic values.
   Callbacks and classifiers receive the original error or a recovered panic with its value and cause.
 - `WithShutdownTimeout` controls the shared drain allowance. It defaults to five seconds. Zero or a negative
   duration cancels admitted work immediately.

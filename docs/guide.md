@@ -62,8 +62,10 @@ consumers can deduplicate retries.
 err := handler.Handle(ctx, record)
 ```
 
-Errors and handler panics trigger retry/dead accounting. Relay-created `Failure.Err` values contain only stable,
-summaries. An optional `FailureHandler` and `FailureClassifier` receive the original handler error and full record.
+Errors and handler panics trigger retry/dead accounting. Relay-created `Failure.Err` values contain generic
+summaries by default. `WithErrorDetails` enables the original error text and panic values for persistence, so
+enable it only when those values are safe to store. An optional `FailureHandler` and `FailureClassifier` receive
+the original handler error and full record.
 Recovered handler panics are delivered as errors containing the panic value, with error-valued panics wrapped as causes.
 
 ### Consumer and Batch
@@ -136,7 +138,7 @@ Key properties:
 - `LIMIT` keeps transactions short.
 - The predicate considers the entire pending backlog; pending rows remain eligible regardless of UUID timestamp.
 
-With `mysql.WithRetryDelay` set to a positive duration, the predicate also requires
+With `mysql.WithRetryDelay` set to a positive duration or `mysql.WithRetrySchedule` enabled, the predicate also requires
 `next_attempt_at IS NULL OR next_attempt_at <= UTC_TIMESTAMP(6)`. This temporarily excludes delayed retries while
 keeping the same ID ordering and locking behavior. Pending counts include delayed rows.
 
@@ -169,17 +171,18 @@ store, err := mysql.NewStore(db, mysql.WithValidatePayload(false))
 
 Each `Fail` call:
 - increments `attempt_count`
-- sets `last_error` (truncated to 1024 chars). Relay-created failures use only `outbox handler failed`,
-  `outbox handler panicked`, or `outbox handler timed out`; direct `Batch.Fail` callers own the safety of supplied errors.
+- sets `last_error` (truncated to 1024 Unicode code points). By default, relay-created failures use
+  `outbox handler failed`, `outbox handler panicked`, or `outbox handler timed out`. `WithErrorDetails`
+  enables the original error text and panic values.
 - keeps `status = pending` until `attempt_count` reaches `MaxAttempts`, then sets `status = dead`
 
-With `mysql.WithRetryDelay` enabled, `Fail` also writes a database-clock deadline to `next_attempt_at` in the same
+With retry scheduling enabled, `Fail` also writes a database-clock deadline to `next_attempt_at` in the same
 transaction. A commit makes both the attempt and deadline durable; a rollback restores both. The delay starts
 at the failure update, so a slow commit can consume part or all of it. New entries have a null deadline and are
 immediately eligible. Processed and dead rows remain terminal regardless of any stored deadline.
 
-The default delay is zero, which preserves immediate retry eligibility on the original schema. A positive delay
-requires the scheduling schema and consumers that all honor deadlines. See the
+The default delay is zero, which preserves immediate retry eligibility on the original schema. A positive delay or
+an enabled retry schedule requires the scheduling schema and consumers that all honor deadlines. See the
 [activation and rollback procedure](migration-v0.3.0.md) before enabling it on an existing table.
 
 `Relay` can classify failures with `FailureClassifier`. When it returns:
