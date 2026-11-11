@@ -206,6 +206,24 @@ Binary payloads require `mysql.WithValidatePayload(false)` on the store. Headers
 `Deduplication` adds a nullable unique key and cannot be combined with partitions, because the key must
 remain unique across the whole table. The helper generates DDL only; it does not alter existing tables.
 
+For independent delivery queues in one table, create an unscoped producer and a scoped store for each
+consumer. A scoped store fetches, settles, counts, and cleans up only rows for its aggregate type. It rejects
+entries with another aggregate type. Add `AggregateTypeIndex` to the schema for these queries and stop any
+unscoped consumers before relying on isolation. Database collation determines query comparisons.
+
+```go
+producer, err := mysql.NewStore(db)
+if err != nil {
+	return err
+}
+endpoint, err := mysql.NewStore(db, mysql.WithAggregateType("endpoint-a"))
+if err != nil {
+	return err
+}
+// Use producer to enqueue and endpoint as the relay's consumer.
+_, _ = producer, endpoint
+```
+
 ```sql
 CREATE TABLE IF NOT EXISTS outbox
 (

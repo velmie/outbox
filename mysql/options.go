@@ -14,6 +14,7 @@ const (
 // Config defines MySQL store behavior.
 type Config struct {
 	Table              string
+	AggregateType      string
 	MaxAttempts        int
 	RetryDelay         time.Duration
 	Clock              outbox.Clock
@@ -24,6 +25,15 @@ type Config struct {
 	validatePayloadSet bool
 	ValidateHeaders    bool
 	validateHeadersSet bool
+}
+
+// WithAggregateType restricts store operations to one aggregate type.
+// Empty preserves the existing unscoped behavior.
+// Enqueue requires an exact match; database comparisons follow column collation.
+func WithAggregateType(value string) Option {
+	return func(c *Config) {
+		c.AggregateType = value
+	}
 }
 
 // Option configures the MySQL store.

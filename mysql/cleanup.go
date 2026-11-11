@@ -228,13 +228,20 @@ func (s *Store) cleanupByStatus(
 	}
 
 	// #nosec G201 -- table and column names are internal and sanitized.
+	scope := ""
+	if s.cfg.AggregateType != "" {
+		scope = aggregateScopePredicate
+	}
 	query := fmt.Sprintf(
-		"DELETE FROM %s WHERE status = ? AND %s IS NOT NULL AND %s <= ? ORDER BY id LIMIT ?",
+		"DELETE FROM %s WHERE status = ? AND %s IS NOT NULL AND %s <= ?%s ORDER BY id LIMIT ?",
 		s.table,
 		tsColumn,
 		tsColumn,
+		scope,
 	)
-	res, err := exec.ExecContext(ctx, query, status, before, limit)
+	args := s.scopeArgs([]any{status, before})
+	args = append(args, limit)
+	res, err := exec.ExecContext(ctx, query, args...)
 	if err != nil {
 		return 0, fmt.Errorf("outbox mysql: cleanup delete failed: %w", err)
 	}

@@ -57,7 +57,7 @@ func NewStore(db *sql.DB, opts ...Option) (*Store, error) {
 	return &Store{
 		db:      db,
 		cfg:     cfg,
-		queries: newQueries(table, cfg.RetryDelay > 0),
+		queries: newQueries(table, cfg.RetryDelay > 0, cfg.AggregateType != ""),
 		table:   table,
 	}, nil
 }
@@ -76,6 +76,9 @@ func MustNewStore(db *sql.DB, opts ...Option) *Store {
 func (s *Store) Enqueue(ctx context.Context, exec Executor, entry outbox.Entry) (outbox.ID, error) {
 	if exec == nil {
 		return outbox.ID{}, ErrExecutorRequired
+	}
+	if s.cfg.AggregateType != "" && entry.AggregateType != s.cfg.AggregateType {
+		return outbox.ID{}, errAggregateTypeMismatch
 	}
 	if err := outbox.ValidateEntryWithOptions(entry, s.cfg.ValidatePayload, s.cfg.ValidateHeaders); err != nil {
 		return outbox.ID{}, err
@@ -149,7 +152,8 @@ func (s *Store) Fetch(ctx context.Context, opts outbox.FetchOptions) (outbox.Bat
 // PendingCount returns the number of pending outbox rows, including delayed retries.
 func (s *Store) PendingCount(ctx context.Context) (int, error) {
 	var count int
-	if err := s.db.QueryRowContext(ctx, s.queries.countPending, outbox.StatusPending).Scan(&count); err != nil {
+	args := s.scopeArgs([]any{outbox.StatusPending})
+	if err := s.db.QueryRowContext(ctx, s.queries.countPending, args...).Scan(&count); err != nil {
 		return 0, fmt.Errorf("outbox mysql: pending count failed: %w", err)
 	}
 
@@ -157,7 +161,9 @@ func (s *Store) PendingCount(ctx context.Context) (int, error) {
 }
 
 func (s *Store) selectBatch(ctx context.Context, tx *sql.Tx, opts outbox.FetchOptions) ([]outbox.Record, error) {
-	rows, err := tx.QueryContext(ctx, s.queries.selectPending, outbox.StatusPending, opts.BatchSize)
+	args := s.scopeArgs([]any{outbox.StatusPending})
+	args = append(args, opts.BatchSize)
+	rows, err := tx.QueryContext(ctx, s.queries.selectPending, args...)
 	if err != nil {
 		return nil, fmt.Errorf("outbox mysql: select failed: %w", err)
 	}
@@ -209,6 +215,10 @@ func (s *Store) ack(ctx context.Context, tx *sql.Tx, ids []outbox.ID) error {
 	for _, id := range ids {
 		args = append(args, id)
 	}
+	if s.cfg.AggregateType != "" {
+		query += aggregateScopePredicate
+		args = append(args, s.cfg.AggregateType)
+	}
 
 	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 		return fmt.Errorf("outbox mysql: ack update failed: %w", err)
@@ -230,6 +240,7 @@ func (s *Store) fail(ctx context.Context, tx *sql.Tx, failures []outbox.Failure)
 			args = append(args, micros)
 		}
 		args = append(args, failure.ID)
+		args = s.scopeArgs(args)
 		if _, err := tx.ExecContext(
 			ctx,
 			s.queries.updateFailureOne,
@@ -249,18 +260,21 @@ func (s *Store) dead(ctx context.Context, tx *sql.Tx, failures []outbox.Failure)
 
 	for _, failure := range failures {
 		errText := truncateError(failure.Err)
-		if _, err := tx.ExecContext(
-			ctx,
-			s.queries.updateDeadOne,
-			errText,
-			outbox.StatusDead,
-			failure.ID,
-		); err != nil {
+		args := s.scopeArgs([]any{errText, outbox.StatusDead, failure.ID})
+		if _, err := tx.ExecContext(ctx, s.queries.updateDeadOne, args...); err != nil {
 			return fmt.Errorf("outbox mysql: dead update failed: %w", err)
 		}
 	}
 
 	return nil
+}
+
+func (s *Store) scopeArgs(args []any) []any {
+	if s.cfg.AggregateType != "" {
+		args = append(args, s.cfg.AggregateType)
+	}
+
+	return args
 }
 
 func buildAckQuery(table string, count int) string {

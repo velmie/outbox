@@ -4,6 +4,7 @@ import "errors"
 
 var (
 	errDeduplicationPartitioned = errors.New("outbox mysql: deduplication cannot be combined with partitions")
+	errAggregateTypeMismatch    = errors.New("outbox mysql: entry aggregate type does not match store scope")
 	// ErrRetryDelayInvalid is returned when the retry delay is negative.
 	ErrRetryDelayInvalid = errors.New("outbox mysql: retry delay must be non-negative")
 	// ErrDBRequired is returned when a nil *sql.DB is provided.
