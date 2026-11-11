@@ -47,14 +47,16 @@ echo "candidate tree: ${candidate_tree}"
 create_proxy_version() {
   local module_path="$1"
   local module_dir="$2"
+  local version="$3"
   local proxy_version_dir="${proxy_dir}/${module_path}/@v"
   local stage_dir="${tmp_dir}/stage-${module_dir//\//_}"
-  local prefix="${module_path}@${VERSION}"
+  local prefix="${module_path}@${version}"
   local module_file
 
   mkdir -p "${proxy_version_dir}" "${stage_dir}/${prefix}"
   if [[ "${module_dir}" == "." ]]; then
-    tar -C "${snapshot_dir}" --exclude='./cmd' --exclude='./mysql' --exclude='./examples/delivery' --exclude='./vendor' -cf - . \
+    tar -C "${snapshot_dir}" --exclude='./cmd' --exclude='./mysql' --exclude='./oteloutbox' \
+      --exclude='./examples/delivery' --exclude='./vendor' -cf - . \
       | tar -C "${stage_dir}/${prefix}" -xf -
     module_file="${snapshot_dir}/go.mod"
   else
@@ -69,17 +71,18 @@ create_proxy_version() {
   (
     cd "${stage_dir}"
     find "${prefix}" -type f -print | LC_ALL=C sort \
-      | zip -q -X "${proxy_version_dir}/${VERSION}.zip" -@
+      | zip -q -X "${proxy_version_dir}/${version}.zip" -@
   )
-  cp -- "${module_file}" "${proxy_version_dir}/${VERSION}.mod"
-  printf '{"Version":"%s","Time":"1970-01-01T00:00:00Z"}\n' "${VERSION}" \
-    >"${proxy_version_dir}/${VERSION}.info"
-  printf '%s\n' "${VERSION}" >"${proxy_version_dir}/list"
+  cp -- "${module_file}" "${proxy_version_dir}/${version}.mod"
+  printf '{"Version":"%s","Time":"1970-01-01T00:00:00Z"}\n' "${version}" \
+    >"${proxy_version_dir}/${version}.info"
+  printf '%s\n' "${version}" >"${proxy_version_dir}/list"
 }
 
-create_proxy_version "github.com/velmie/outbox" "."
-create_proxy_version "github.com/velmie/outbox/mysql" "mysql"
-create_proxy_version "github.com/velmie/outbox/cmd" "cmd"
+create_proxy_version "github.com/velmie/outbox" "." "${VERSION}"
+create_proxy_version "github.com/velmie/outbox/mysql" "mysql" "${VERSION}"
+create_proxy_version "github.com/velmie/outbox/cmd" "cmd" "${VERSION}"
+create_proxy_version "github.com/velmie/outbox/oteloutbox" "oteloutbox" "v0.1.0"
 
 mod_cache="${tmp_dir}/modcache"
 bin_dir="${tmp_dir}/bin"
@@ -105,9 +108,10 @@ release_env=(
 )
 
 for module_path in \
-  github.com/velmie/outbox \
-  github.com/velmie/outbox/mysql \
-  github.com/velmie/outbox/cmd; do
+  "github.com/velmie/outbox@${VERSION}" \
+  "github.com/velmie/outbox/mysql@${VERSION}" \
+  "github.com/velmie/outbox/cmd@${VERSION}" \
+  "github.com/velmie/outbox/oteloutbox@v0.1.0"; do
   env \
     "GOMODCACHE=${mod_cache}" \
     "GONOPROXY=none" \
@@ -115,10 +119,10 @@ for module_path in \
     "GOPROXY=file://${proxy_dir}" \
     "GOTOOLCHAIN=go1.26.11" \
     "GOWORK=off" \
-    go mod download "${module_path}@${VERSION}"
+    go mod download "${module_path}"
 done
 
-for module in . mysql cmd examples/delivery; do
+for module in . mysql cmd oteloutbox examples/delivery; do
   module_dir="${ROOT_DIR}/${module}"
   echo "==> ${module}: GOWORK=off release metadata and tests"
   (
@@ -138,7 +142,8 @@ grep -Fxq "github.com/velmie/outbox ${VERSION}" <<<"${cmd_graph}"
 grep -Fxq "github.com/velmie/outbox/mysql ${VERSION}" <<<"${cmd_graph}"
 
 if grep -Eq '^[[:space:]]*replace([[:space:]]|$)' \
-  "${ROOT_DIR}/go.mod" "${ROOT_DIR}/mysql/go.mod" "${ROOT_DIR}/cmd/go.mod" "${ROOT_DIR}/examples/delivery/go.mod"; then
+  "${ROOT_DIR}/go.mod" "${ROOT_DIR}/mysql/go.mod" "${ROOT_DIR}/cmd/go.mod" \
+  "${ROOT_DIR}/oteloutbox/go.mod" "${ROOT_DIR}/examples/delivery/go.mod"; then
   echo "release modules must not contain replace directives" >&2
   exit 1
 fi

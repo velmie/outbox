@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODULES=(. mysql cmd examples/delivery)
+MODULES=(. mysql cmd oteloutbox examples/delivery)
 
 export GOTOOLCHAIN=go1.26.11
 
@@ -36,7 +36,8 @@ workspace_dir="$(mktemp -d)"
 trap 'rm -rf -- "${workspace_dir}"' EXIT
 (
   cd "${workspace_dir}"
-  GOWORK=off go work init "${ROOT_DIR}" "${ROOT_DIR}/mysql" "${ROOT_DIR}/cmd" "${ROOT_DIR}/examples/delivery"
+  GOWORK=off go work init \
+    "${ROOT_DIR}" "${ROOT_DIR}/mysql" "${ROOT_DIR}/cmd" "${ROOT_DIR}/oteloutbox" "${ROOT_DIR}/examples/delivery"
 )
 export GOWORK="${workspace_dir}/go.work"
 go work edit -go=1.26.11 \
