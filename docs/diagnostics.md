@@ -59,7 +59,9 @@ as the overall result. Do not infer overall success from the last DDL event.
 - `retry_in` is a `time.Duration` on `relay.storage_error`, containing the proposed wait. Cancellation can
   interrupt it. `err` identifies the failed fetch, settlement, commit, or rollback and retains joined causes.
 - `count` is an `int` on the unsupported dead-letter event.
-- `reason` is the fixed string `lock_busy` on skipped maintenance passes.
+- `reason` is `lock_busy` on skipped passes. With a drain budget, the first batch always runs after taking
+  the lock. Each full batch repeats only while budget remains, without cancelling a running batch.
+  Budget exhaustion emits `cleanup.completed` / `succeeded` with `reason=budget_exhausted`, not an empty-backlog guarantee.
 - `stage` is a fixed string on failed maintenance passes. Cleanup stages are `connect`, `acquire_lock`,
   `cleanup`, `release_lock`, and `operation_and_release`. Partition stages additionally use
   `resolve_schema`, `inspect`, `plan`, `reorganize`, and `drop` instead of `cleanup`.

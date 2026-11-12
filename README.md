@@ -221,8 +221,8 @@ store, err := mysql.NewStore(db,
 
 Apply the schema through a controlled migration before starting consumers. The option does not execute DDL.
 The existing schema helpers and stores without the option retain immediate retry eligibility and do not require
-the additional column. A zero delay disables scheduling; negative values are rejected. Positive durations round
-up to the next microsecond, matching MySQL's timestamp precision.
+the additional column. A zero delay disables scheduling unless `WithRetryScheduling` or a schedule enables it.
+Negative values are rejected. Positive durations round up to the next microsecond, matching MySQL's timestamp precision.
 
 For attempt-dependent delays, use a concurrency-safe schedule. The argument is the just-failed
 attempt, starting at one. A handler can add a minimum delay with `outbox.RetryAfter`:
@@ -243,8 +243,8 @@ relay := outbox.NewRelay(store, outbox.HandlerFunc(func(ctx context.Context, rec
 _ = relay
 ```
 
-The longer of the configured delay and the hint applies. A zero-returning schedule enables hints
-without a base delay. A positive fixed delay and a schedule cannot be combined. A positive hint for a
+The longer of the configured delay and the hint applies. Use `mysql.WithRetryScheduling()` to enable
+handler hints without a base delay or schedule function. A positive fixed delay and a schedule cannot be combined. A positive hint for a
 retryable failure without scheduling rolls back the batch and returns an error. `Run` stops its workers;
 `ProcessOnce` returns the error to its caller. A dead-letter classification or exhausted attempt limit
 takes precedence over the hint.
@@ -288,7 +288,10 @@ tables can opt in through the explicit migration while retaining their payload a
 Requeue performs one bounded update of dead rows. Select by IDs, aggregate type, event type, or a
 combination. Selectors intersect with the store scope. At least one selector and a positive limit are
 required. The operation resets attempts, error and processed time, preserving the ID, payload, headers,
-deduplication key and creation time. Enable scheduling on the store to clear retry deadlines too.
+deduplication key and creation time. For a table with `next_attempt_at`, construct the store with
+`mysql.WithRetryScheduling()` to clear retry deadlines too. Requeue-only callers need no delay or schedule.
+The option also makes fetches honor deadlines and executes no schema changes. It preserves any configured
+`WithRetryDelay` or `WithRetrySchedule`.
 
 ```go
 count, err := endpoint.Requeue(ctx, mysql.RequeueOptions{
@@ -700,11 +703,12 @@ func main() {
 	defer db.Close()
 
 	maintainer, err := mysql.NewCleanupMaintainer(db, mysql.CleanupMaintainerConfig{
-		Table:       "outbox",
-		Retention:   7 * 24 * time.Hour,
-		CheckEvery:  time.Hour,
-		Limit:       10000,
-		IncludeDead: true,
+		Table:        "outbox",
+		Retention:    7 * 24 * time.Hour,
+		CheckEvery:   time.Hour,
+		Limit:        10000,
+		DrainTimeout: 30 * time.Second,
+		IncludeDead:  true,
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -715,6 +719,15 @@ func main() {
 	}
 }
 ```
+
+A positive `DrainTimeout` enables repeated batches, each bounded by `Limit`. After taking the lock, the
+first batch always runs. After each full batch, the pass continues only while the budget has not elapsed.
+The budget starts at entry to `Ensure` and never cancels a running batch. Exhaustion returns totals with a
+nil error. The default zero runs one batch per pass. `CleanupResult` totals confirmed deletions, including
+partial results on error. The same connection holds the advisory lock across all batches with one retention
+cutoff. Cleanup work can exceed the budget by one batch. Caller cancellation still interrupts the pass,
+and lock release has a separate cleanup allowance.
+See the [cleanup guide](docs/guide.md#non-partitioned-cleanup-batch-delete) for timing and failure semantics.
 
 Supply `OUTBOX_DSN` through the process environment or a secret manager. The
 deprecated `-dsn` flag is retained for compatibility in v0.2.0.

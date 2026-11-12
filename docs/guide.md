@@ -197,7 +197,7 @@ Key properties:
 - The predicate considers the pending backlog within the configured scope, or the whole table when unscoped.
   Pending rows remain eligible regardless of UUID timestamp.
 
-With `mysql.WithRetryDelay` set to a positive duration or `mysql.WithRetrySchedule` enabled, the predicate also requires
+With `mysql.WithRetryScheduling()`, a positive `mysql.WithRetryDelay`, or `mysql.WithRetrySchedule`, the predicate also requires
 `next_attempt_at IS NULL OR next_attempt_at <= UTC_TIMESTAMP(6)`. This temporarily excludes delayed retries while
 keeping the same ID ordering and locking behavior. Pending counts include delayed rows.
 
@@ -240,8 +240,15 @@ transaction. A commit makes both the attempt and deadline durable; a rollback re
 at the failure update, so a slow commit can consume part or all of it. New entries have a null deadline and are
 immediately eligible. Processed and dead rows remain terminal regardless of any stored deadline.
 
-The default delay is zero, which preserves immediate retry eligibility on the original schema. A positive delay or
-an enabled retry schedule requires the scheduling schema and consumers that all honor deadlines. See the
+Use `mysql.WithRetryScheduling()` when the table has `next_attempt_at` but the caller has no base delay or
+schedule function. Fetch honors stored deadlines, handler `RetryAfter` hints set deadlines, and `Requeue`
+clears deadlines when returning dead records to pending. Without a hint, failures remain immediately eligible.
+The option does not create or migrate the table and does not override a configured delay or schedule.
+A requeue-only store can use it without inventing a schedule function.
+
+Scheduling remains disabled by default, preserving immediate retry eligibility on the original schema.
+Explicit scheduling, a positive delay, or a schedule function requires the scheduling schema and consumers
+that all honor deadlines. See the
 [activation and rollback procedure](migration-v0.3.0.md) before enabling it on an existing table.
 
 `Relay` can classify failures with `FailureClassifier`. When it returns:
@@ -420,11 +427,12 @@ For automated cleanup in the application, use `mysql.CleanupMaintainer`:
 
 ```go
 maintainer, err := mysql.NewCleanupMaintainer(db, mysql.CleanupMaintainerConfig{
-	Table:       "outbox",
-	Retention:   7 * 24 * time.Hour,
-	CheckEvery:  time.Hour,
-	Limit:       10000,
-	IncludeDead: true,
+	Table:        "outbox",
+	Retention:    7 * 24 * time.Hour,
+	CheckEvery:   time.Hour,
+	Limit:        10000,
+	DrainTimeout: 30 * time.Second,
+	IncludeDead:  true,
 })
 if err != nil {
 	return err
@@ -434,6 +442,30 @@ if err := maintainer.Run(ctx); err != nil {
 	return err // Treat context cancellation according to the service lifecycle.
 }
 ```
+
+`DrainTimeout` is opt-in. Its default zero performs one bounded batch per `Ensure`. A positive
+value repeats batches until a batch's processed plus dead count is less than `Limit`. Each batch prioritizes
+processed rows and uses any remaining capacity for dead rows. An exact multiple of `Limit` needs an empty
+batch to confirm completion if budget remains. Negative budgets are rejected. `Store.Cleanup` itself still performs one batch.
+
+The budget starts at entry to `Ensure`. After taking the lock, the first batch always runs. After each full
+batch, the pass continues only while the budget has not elapsed. The budget never cancels a running batch.
+Exhaustion returns confirmed totals with a nil error. Cleanup work can exceed the budget by one batch;
+connection acquisition and lock release can add time outside that bound. Caller cancellation or deadline
+expiry still interrupts database operations and returns an error with confirmed deletion counts.
+
+One database connection holds the same advisory lock for the entire pass, including the intervals between
+batches. Another maintainer using that lock skips its pass. The retention cutoff is computed once and does
+not move as the pass runs. Lock release always runs and retains its existing separate five-second allowance,
+even after cancellation. Release failure is joined with the primary error, and an unconfirmed release discards
+the connection.
+
+Each `Ensure` still emits one terminal diagnostic: completed after successful work and release, skipped on a
+busy lock, or failed with the original causes. Budget exhaustion emits `cleanup.completed` with outcome
+`succeeded` and reason `budget_exhausted`. It does not mean that all eligible rows were removed. `Run`
+retains its periodic schedule, so the next pass continues cleanup, and reports pass failures through the
+configured logger. `CleanupResult` is the sum for that pass. Call `Ensure` directly to inspect its result
+and error before running a follow-up statement.
 
 Standalone CLI (cron / CronJob). Supply `OUTBOX_DSN` through the process environment
 or a secret manager; the deprecated `-dsn` flag is retained for compatibility in v0.2.0:
@@ -454,7 +486,8 @@ instances; the default is `outbox:cleanup:<table>`. A pass is skipped while anot
 
 Operational note: batched deletes can still create I/O and undo pressure. For large tables, prefer partitioning or schedule cleanup during off-peak hours. If cleanup becomes slow, consider adding composite indexes for the cutoff columns (for example, `(status, processed_at)` or `(status, updated_at)`).
 
-The CLI reuses the same maintainer logic, so behavior is identical; it just runs under a different user and schedule.
+The CLI uses the maintainer with its default single-batch behavior. Repeated batches with a pass budget are
+configured through the embedded maintainer.
 
 ## Practical recommendations
 
