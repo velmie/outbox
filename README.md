@@ -896,7 +896,7 @@ Reproduce: [docs/benchmarks.md](docs/benchmarks.md).
 The [delivery queue example](examples/delivery/README.md) exercises JetStream admission, MySQL, and HTTP
 delivery against test-owned dependencies.
 
-See [docs/release-next.md](docs/release-next.md) for unreleased changes.
+See [docs/release-v0.7.0.md](docs/release-v0.7.0.md) for the v0.7.0 release notes.
 See [docs/guide.md](docs/guide.md) for architecture, tuning, failure handling, cleanup, and extension notes.
 See [docs/benchmarks.md](docs/benchmarks.md) for the research harness and plotting workflow.
 See [docs/migration-v0.6.0.md](docs/migration-v0.6.0.md) and [docs/release-v0.6.0.md](docs/release-v0.6.0.md)
@@ -944,7 +944,7 @@ done
 ```
 
 The complete gate requires Go 1.26.11, Git, tar, zip, Docker, golangci-lint 2.12.2, govulncheck 1.7.0, and Trivy 0.74.0.
-Run `./scripts/verify.sh` for the library, commands, and delivery example. It verifies the v0.6.0 candidate module
+Run `./scripts/verify.sh` for the library, commands, and delivery example. It verifies the v0.7.0 candidate module
 graph without `go.work`, then runs integration tests, `govulncheck`, and Trivy.
 
 ## License

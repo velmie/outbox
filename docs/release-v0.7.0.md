@@ -1,4 +1,7 @@
-# Next release (unreleased)
+# outbox v0.7.0
+
+v0.7.0 is a coordinated release of the root, MySQL, and command modules. Every addition is opt-in: existing
+relays, stores, and cleanup maintainers keep their behavior. Delivery remains at least once.
 
 - `WithStorageErrorBackoff(minimum, maximum)` lets `Run` workers recover independently from storage errors,
   with bounded exponential waits and diagnostics through the existing logger. Contract errors remain fatal.
