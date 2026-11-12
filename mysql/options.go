@@ -13,9 +13,11 @@ const (
 
 // Config defines MySQL store behavior.
 type Config struct {
-	Table              string
-	AggregateType      string
-	MaxAttempts        int
+	Table         string
+	AggregateType string
+	MaxAttempts   int
+	// RetryScheduling declares that the table has next_attempt_at.
+	RetryScheduling    bool
 	RetryDelay         time.Duration
 	RetrySchedule      func(attempt int) time.Duration
 	Clock              outbox.Clock
@@ -39,6 +41,16 @@ func WithAggregateType(value string) Option {
 
 // Option configures the MySQL store.
 type Option func(*Config)
+
+// WithRetryScheduling declares that the table uses durable retry scheduling.
+// The table must have next_attempt_at, as provided by RetrySchema. Fetch honors
+// deadlines, Requeue clears them, and handler retry hints work without a base delay.
+// This option preserves any configured RetryDelay or RetrySchedule and executes no DDL.
+func WithRetryScheduling() Option {
+	return func(c *Config) {
+		c.RetryScheduling = true
+	}
+}
 
 // WithRetrySchedule enables durable scheduling through next_attempt_at.
 // attempt is the just-failed attempt, starting at 1. The schedule must be
@@ -65,8 +77,9 @@ func WithMaxAttempts(attempts int) Option {
 
 // WithRetryDelay enables durable retry scheduling with a fixed delay.
 // The table must include the next_attempt_at column provided by RetrySchema.
-// Every consumer of a scheduled table must enable scheduling. Zero disables it;
-// negative values are invalid. Positive values round up to microsecond precision.
+// Every consumer of a scheduled table must enable scheduling. Zero disables this delay;
+// WithRetryScheduling or WithRetrySchedule can still enable scheduling.
+// Negative values are invalid. Positive values round up to microsecond precision.
 // Deadlines use database UTC time at the failure update, independently of WithClock.
 func WithRetryDelay(delay time.Duration) Option {
 	return func(c *Config) {
@@ -118,7 +131,7 @@ func WithValidateHeaders(enabled bool) Option {
 }
 
 func (c Config) retryScheduling() bool {
-	return c.RetryDelay > 0 || c.RetrySchedule != nil
+	return c.RetryScheduling || c.RetryDelay > 0 || c.RetrySchedule != nil
 }
 
 func (c Config) withDefaults() Config {

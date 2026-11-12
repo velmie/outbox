@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 
@@ -74,7 +73,7 @@ func run(ctx context.Context, args []string, dsn string, out, diagnostics io.Wri
 	}
 	opts := []mysql.Option{mysql.WithTable(*table)}
 	if *scheduled {
-		opts = append(opts, mysql.WithRetrySchedule(func(int) time.Duration { return 0 }))
+		opts = append(opts, mysql.WithRetryScheduling())
 	}
 	store, err := mysql.NewStore(db, opts...)
 	if err != nil {

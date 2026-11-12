@@ -41,6 +41,8 @@ var (
 	ErrCleanupBeforeRequired = errors.New("outbox mysql: cleanup before time is required")
 	// ErrCleanupLimitInvalid is returned when cleanup limit is negative.
 	ErrCleanupLimitInvalid = errors.New("outbox mysql: cleanup limit must be non-negative")
+	// ErrCleanupDrainTimeoutInvalid is returned when the cleanup drain budget is negative.
+	ErrCleanupDrainTimeoutInvalid = errors.New("outbox mysql: cleanup drain timeout must be non-negative")
 	// ErrCleanupRetentionInvalid is returned when cleanup retention is not positive.
 	ErrCleanupRetentionInvalid = errors.New("outbox mysql: cleanup retention must be positive")
 )

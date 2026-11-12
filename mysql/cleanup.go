@@ -26,7 +26,8 @@ type CleanupOptions struct {
 	IncludeDead bool
 }
 
-// CleanupResult reports confirmed row deletions and may be partial when Cleanup returns an error.
+// CleanupResult reports confirmed row deletions from Cleanup or an entire Ensure pass.
+// The result may be partial when either method returns an error.
 // A count is included only after both DELETE and RowsAffected succeed.
 // A zero count with an error does not prove that no rows were deleted.
 type CleanupResult struct {
@@ -42,8 +43,16 @@ type CleanupMaintainerConfig struct {
 	Retention time.Duration
 	// CheckEvery is the interval between cleanup runs.
 	CheckEvery time.Duration
-	// Limit caps the number of rows deleted per run (0 uses the default).
+	// Limit caps the number of rows deleted per batch (0 uses the default).
 	Limit int
+	// DrainTimeout enables repeated batches until one deletes fewer than Limit rows.
+	// Positive values set a budget starting at entry to Ensure. The first batch
+	// always runs after taking the lock. After each full batch, the pass continues
+	// only while the budget has not elapsed. The budget never cancels a running batch.
+	// Exhaustion returns confirmed totals with nil error. Cleanup work can exceed
+	// the budget by one Limit-bounded batch, plus connection and lock release time.
+	// Zero keeps one batch per pass; negative values are invalid.
+	DrainTimeout time.Duration
 	// IncludeDead removes dead rows in addition to processed rows.
 	IncludeDead bool
 	// LockName is the 1-to-64-character advisory lock name. Defaults to outbox:cleanup:<table>.
@@ -72,6 +81,9 @@ func (s *Store) Cleanup(ctx context.Context, opts CleanupOptions) (CleanupResult
 func NewCleanupMaintainer(db *sql.DB, cfg CleanupMaintainerConfig) (*CleanupMaintainer, error) {
 	if db == nil {
 		return nil, ErrDBRequired
+	}
+	if cfg.DrainTimeout < 0 {
+		return nil, ErrCleanupDrainTimeoutInvalid
 	}
 	if cfg.Retention <= 0 {
 		return nil, ErrCleanupRetentionInvalid
@@ -124,8 +136,13 @@ func (m *CleanupMaintainer) Run(ctx context.Context) error {
 	}
 }
 
-// Ensure executes a single cleanup pass.
+// Ensure executes one cleanup pass and returns its confirmed deletion totals.
+// With DrainTimeout enabled, the same connection and advisory lock cover all
+// batches. The retention cutoff is fixed for the pass. Errors retain counts
+// from earlier batches and any confirmed part of the failing batch.
 func (m *CleanupMaintainer) Ensure(ctx context.Context) (result CleanupResult, err error) {
+	started := time.Now()
+	budgetExhausted := false
 	stage := maintenanceStageConnect
 	skipped := false
 	completed := false
@@ -138,6 +155,10 @@ func (m *CleanupMaintainer) Ensure(ctx context.Context) (result CleanupResult, e
 		case skipped:
 			m.cfg.Logger.Debug("outbox cleanup lock held by another session",
 				"event", "cleanup.skipped", "operation", "cleanup.ensure", "outcome", "skipped", "reason", "lock_busy",
+			)
+		case budgetExhausted:
+			m.cfg.Logger.Debug("outbox cleanup budget exhausted",
+				"event", "cleanup.completed", "operation", "cleanup.ensure", "outcome", "succeeded", "reason", "budget_exhausted",
 			)
 		case completed:
 			m.cfg.Logger.Debug("outbox cleanup completed", "event", "cleanup.completed", "operation", "cleanup.ensure", "outcome", "succeeded")
@@ -175,14 +196,28 @@ func (m *CleanupMaintainer) Ensure(ctx context.Context) (result CleanupResult, e
 	stage = "cleanup"
 	before := m.cfg.Clock.Now().Add(-m.cfg.Retention)
 
-	result, err = m.store.cleanup(ctx, conn, CleanupOptions{
-		Before:      before,
-		Limit:       m.cfg.Limit,
-		IncludeDead: m.cfg.IncludeDead,
-	})
-	completed = true
+	for {
+		batch, cleanupErr := m.store.cleanup(ctx, conn, CleanupOptions{
+			Before:      before,
+			Limit:       m.cfg.Limit,
+			IncludeDead: m.cfg.IncludeDead,
+		})
+		result.Processed += batch.Processed
+		result.Dead += batch.Dead
+		if cleanupErr != nil {
+			return result, cleanupErr
+		}
+		if m.cfg.DrainTimeout == 0 || batch.Processed+batch.Dead < int64(m.cfg.Limit) {
+			completed = true
 
-	return result, err
+			return result, nil
+		}
+		if time.Since(started) >= m.cfg.DrainTimeout {
+			budgetExhausted = true
+
+			return result, nil
+		}
+	}
 }
 
 func (s *Store) cleanup(ctx context.Context, exec Executor, opts CleanupOptions) (CleanupResult, error) {

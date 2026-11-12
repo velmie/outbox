@@ -155,6 +155,34 @@ Delivery is at least once: publication may succeed before the relay can acknowle
 and downstream consumers must be idempotent. Publish `Record.ID` as the stable message identifier so downstream
 consumers can deduplicate retries.
 
+### Storage recovery and idle polling
+
+Both behaviors are opt-in and apply only to `Run`:
+
+```go
+relay := outbox.NewRelay(store, handler,
+    outbox.WithLogger(slog.Default()),
+    outbox.WithStorageErrorBackoff(100*time.Millisecond, 5*time.Second),
+    outbox.WithPollInterval(50*time.Millisecond),
+    outbox.WithIdleBackoff(time.Second),
+)
+```
+
+`WithStorageErrorBackoff` lets each worker report a storage error, wait, and fetch again without stopping
+other workers. The wait doubles from the minimum to the maximum and resets only after an empty fetch or a
+successfully processed and committed batch. Contract errors remain fatal. Without the option, storage errors
+still stop `Run`.
+An unsuccessful commit has an uncertain outcome. The relay attempts rollback and fetches a new batch;
+records whose changes did not commit remain eligible and may be delivered again with the same IDs.
+
+`WithIdleBackoff` doubles each worker's sleep after consecutive empty fetches, from `PollInterval` to the
+configured maximum. Fetching records resets it. This reduces idle queries at the cost of up to the maximum
+in added polling latency for the first record after an idle period. Storage recovery and handler time can
+add further delay. Without the option, empty polls retain the fixed `PollInterval`.
+
+See the [relay guide](docs/guide.md#storage-recovery-and-idle-backoff) for error classification, option bounds,
+and shutdown behavior. Configure a logger to observe recovery; the default `NopLogger` discards diagnostics.
+
 ### Shutdown
 
 `Run` stops admitting polling iterations when its parent is canceled or reaches its deadline, or when a worker
@@ -176,7 +204,7 @@ when the caller needs to distinguish its cancellation from its deadline. A drain
 
 ## Defaults
 
-- `Relay`: batch size 50, poll interval 50ms, workers 1.
+- `Relay`: batch size 50, poll interval 50ms, workers 1. Storage recovery and idle backoff are disabled.
 - `MySQL`: table `outbox`, max attempts 5, UUID v7 generator, JSON validation enabled.
 
 ## Durable retry delay
@@ -193,8 +221,8 @@ store, err := mysql.NewStore(db,
 
 Apply the schema through a controlled migration before starting consumers. The option does not execute DDL.
 The existing schema helpers and stores without the option retain immediate retry eligibility and do not require
-the additional column. A zero delay disables scheduling; negative values are rejected. Positive durations round
-up to the next microsecond, matching MySQL's timestamp precision.
+the additional column. A zero delay disables scheduling unless `WithRetryScheduling` or a schedule enables it.
+Negative values are rejected. Positive durations round up to the next microsecond, matching MySQL's timestamp precision.
 
 For attempt-dependent delays, use a concurrency-safe schedule. The argument is the just-failed
 attempt, starting at one. A handler can add a minimum delay with `outbox.RetryAfter`:
@@ -215,8 +243,8 @@ relay := outbox.NewRelay(store, outbox.HandlerFunc(func(ctx context.Context, rec
 _ = relay
 ```
 
-The longer of the configured delay and the hint applies. A zero-returning schedule enables hints
-without a base delay. A positive fixed delay and a schedule cannot be combined. A positive hint for a
+The longer of the configured delay and the hint applies. Use `mysql.WithRetryScheduling()` to enable
+handler hints without a base delay or schedule function. A positive fixed delay and a schedule cannot be combined. A positive hint for a
 retryable failure without scheduling rolls back the batch and returns an error. `Run` stops its workers;
 `ProcessOnce` returns the error to its caller. A dead-letter classification or exhausted attempt limit
 takes precedence over the hint.
@@ -260,7 +288,10 @@ tables can opt in through the explicit migration while retaining their payload a
 Requeue performs one bounded update of dead rows. Select by IDs, aggregate type, event type, or a
 combination. Selectors intersect with the store scope. At least one selector and a positive limit are
 required. The operation resets attempts, error and processed time, preserving the ID, payload, headers,
-deduplication key and creation time. Enable scheduling on the store to clear retry deadlines too.
+deduplication key and creation time. For a table with `next_attempt_at`, construct the store with
+`mysql.WithRetryScheduling()` to clear retry deadlines too. Requeue-only callers need no delay or schedule.
+The option also makes fetches honor deadlines and executes no schema changes. It preserves any configured
+`WithRetryDelay` or `WithRetrySchedule`.
 
 ```go
 count, err := endpoint.Requeue(ctx, mysql.RequeueOptions{
@@ -672,11 +703,12 @@ func main() {
 	defer db.Close()
 
 	maintainer, err := mysql.NewCleanupMaintainer(db, mysql.CleanupMaintainerConfig{
-		Table:       "outbox",
-		Retention:   7 * 24 * time.Hour,
-		CheckEvery:  time.Hour,
-		Limit:       10000,
-		IncludeDead: true,
+		Table:        "outbox",
+		Retention:    7 * 24 * time.Hour,
+		CheckEvery:   time.Hour,
+		Limit:        10000,
+		DrainTimeout: 30 * time.Second,
+		IncludeDead:  true,
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -687,6 +719,15 @@ func main() {
 	}
 }
 ```
+
+A positive `DrainTimeout` enables repeated batches, each bounded by `Limit`. After taking the lock, the
+first batch always runs. After each full batch, the pass continues only while the budget has not elapsed.
+The budget starts at entry to `Ensure` and never cancels a running batch. Exhaustion returns totals with a
+nil error. The default zero runs one batch per pass. `CleanupResult` totals confirmed deletions, including
+partial results on error. The same connection holds the advisory lock across all batches with one retention
+cutoff. Cleanup work can exceed the budget by one batch. Caller cancellation still interrupts the pass,
+and lock release has a separate cleanup allowance.
+See the [cleanup guide](docs/guide.md#non-partitioned-cleanup-batch-delete) for timing and failure semantics.
 
 Supply `OUTBOX_DSN` through the process environment or a secret manager. The
 deprecated `-dsn` flag is retained for compatibility in v0.2.0.
@@ -855,6 +896,7 @@ Reproduce: [docs/benchmarks.md](docs/benchmarks.md).
 The [delivery queue example](examples/delivery/README.md) exercises JetStream admission, MySQL, and HTTP
 delivery against test-owned dependencies.
 
+See [docs/release-v0.7.0.md](docs/release-v0.7.0.md) for the v0.7.0 release notes.
 See [docs/guide.md](docs/guide.md) for architecture, tuning, failure handling, cleanup, and extension notes.
 See [docs/benchmarks.md](docs/benchmarks.md) for the research harness and plotting workflow.
 See [docs/migration-v0.6.0.md](docs/migration-v0.6.0.md) and [docs/release-v0.6.0.md](docs/release-v0.6.0.md)
@@ -902,7 +944,7 @@ done
 ```
 
 The complete gate requires Go 1.26.11, Git, tar, zip, Docker, golangci-lint 2.12.2, govulncheck 1.7.0, and Trivy 0.74.0.
-Run `./scripts/verify.sh` for the library, commands, and delivery example. It verifies the v0.6.0 candidate module
+Run `./scripts/verify.sh` for the library, commands, and delivery example. It verifies the v0.7.0 candidate module
 graph without `go.work`, then runs integration tests, `govulncheck`, and Trivy.
 
 ## License

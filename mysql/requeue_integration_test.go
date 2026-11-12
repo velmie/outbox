@@ -27,7 +27,7 @@ func TestRequeueDeadDelivery(t *testing.T) {
 	require.NoError(t, err)
 	_, err = db.ExecContext(ctx, ddl)
 	require.NoError(t, err)
-	store, err := mysql.NewStore(db, mysql.WithRetrySchedule(func(int) time.Duration { return 0 }))
+	store, err := mysql.NewStore(db, mysql.WithRetryScheduling())
 	require.NoError(t, err)
 	entry := outbox.Entry{
 		AggregateType: "endpoint",

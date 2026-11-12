@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="v0.6.0"
+VERSION="v0.7.0"
 
 for command in go git tar zip; do
   if ! command -v "${command}" >/dev/null 2>&1; then

@@ -41,8 +41,8 @@ trap 'rm -rf -- "${workspace_dir}"' EXIT
 )
 export GOWORK="${workspace_dir}/go.work"
 go work edit -go=1.26.11 \
-  -replace="github.com/velmie/outbox@v0.6.0=${ROOT_DIR}" \
-  -replace="github.com/velmie/outbox/mysql@v0.6.0=${ROOT_DIR}/mysql"
+  -replace="github.com/velmie/outbox@v0.7.0=${ROOT_DIR}" \
+  -replace="github.com/velmie/outbox/mysql@v0.7.0=${ROOT_DIR}/mysql"
 
 echo "==> release module graph"
 bash "${ROOT_DIR}/scripts/verify-release-modules.sh"

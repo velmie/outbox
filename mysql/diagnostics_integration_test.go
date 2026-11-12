@@ -64,12 +64,3 @@ func TestMaintenanceDiagnosticsIntegration(t *testing.T) {
 	require.NoError(t, partitions.Ensure(ctx))
 	require.Equal(t, []string{"partitions.completed"}, maintenanceEvents(logger))
 }
-
-func maintenanceEvents(logger *maintenanceLogger) []string {
-	events := make([]string, 0, len(logger.events))
-	for _, event := range logger.events {
-		name, _ := event["event"].(string)
-		events = append(events, name)
-	}
-	return events
-}

@@ -8,6 +8,10 @@ var (
 	ErrDuplicate = errors.New("outbox entry already exists")
 	// ErrInvalidBatchSize indicates that the requested batch size is not positive.
 	ErrInvalidBatchSize = errors.New("outbox batch size must be positive")
+	// ErrInvalidRetryPolicy identifies a retry scheduling contract violation.
+	// Adapters wrap it with the affected record and specific policy failure.
+	// Run does not retry it, even with storage error backoff enabled.
+	ErrInvalidRetryPolicy = errors.New("outbox retry policy is invalid")
 	// ErrNoRecords signals that no records are available for processing.
 	ErrNoRecords = errors.New("outbox has no pending records")
 	// ErrNilBatch indicates that a consumer returned a nil batch.

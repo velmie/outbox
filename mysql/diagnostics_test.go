@@ -173,6 +173,9 @@ func (l *maintenanceLogger) record(args []any) {
 }
 
 type maintenanceConnector struct {
+	exec    func(context.Context, string, []driver.NamedValue) (driver.Result, error)
+	onQuery func(context.Context, string)
+
 	expand            bool
 	ddlErr            error
 	busy              bool
@@ -197,7 +200,10 @@ func (*maintenanceConn) Prepare(string) (driver.Stmt, error) {
 }
 func (*maintenanceConn) Close() error              { return nil }
 func (*maintenanceConn) Begin() (driver.Tx, error) { return nil, errors.New("unexpected transaction") }
-func (c *maintenanceConn) ExecContext(context.Context, string, []driver.NamedValue) (driver.Result, error) {
+func (c *maintenanceConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	if c.exec != nil {
+		return c.exec(ctx, query, args)
+	}
 	if c.ddlErr != nil {
 		return nil, c.ddlErr
 	}
@@ -206,7 +212,10 @@ func (c *maintenanceConn) ExecContext(context.Context, string, []driver.NamedVal
 	}
 	return driver.RowsAffected(0), nil
 }
-func (c *maintenanceConn) QueryContext(_ context.Context, q string, _ []driver.NamedValue) (driver.Rows, error) {
+func (c *maintenanceConn) QueryContext(ctx context.Context, q string, _ []driver.NamedValue) (driver.Rows, error) {
+	if c.onQuery != nil {
+		c.onQuery(ctx, q)
+	}
 	switch {
 	case strings.Contains(q, "GET_LOCK"):
 		if c.busy {
@@ -254,3 +263,12 @@ func (r *maintenanceRows) Next(dest []driver.Value) error {
 type maintenancePanicClock struct{}
 
 func (maintenancePanicClock) Now() time.Time { panic("clock panic") }
+
+func maintenanceEvents(logger *maintenanceLogger) []string {
+	events := make([]string, 0, len(logger.events))
+	for _, event := range logger.events {
+		name, _ := event["event"].(string)
+		events = append(events, name)
+	}
+	return events
+}
