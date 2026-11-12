@@ -15,6 +15,7 @@ handle unknown events without treating them as successful operations.
 
 | `event` | `operation` | `outcome` | Meaning |
 | --- | --- | --- | --- |
+| `relay.storage_error` | `relay.fetch` or `relay.process_batch` | `retrying` | A storage operation failed and the worker will wait before fetching again. |
 | `relay.worker_failed` | `relay.run` | `failed` | A worker returned an error. |
 | `relay.worker_panicked` | `relay.run` | `failed` | A worker panic was recovered; `err` includes the panic value. |
 | `relay.pending_count_failed` | `relay.pending_count` | `failed` | Pending sampling failed. Delivery can continue. |
@@ -54,7 +55,9 @@ as the overall result. Do not infer overall success from the last DDL event.
 
 ## Additional fields and error causes
 
-- `worker` is an `int` on relay worker failures and panics.
+- `worker` is an `int` on relay storage errors, worker failures, and panics.
+- `retry_in` is a `time.Duration` on `relay.storage_error`, containing the proposed wait. Cancellation can
+  interrupt it. `err` identifies the failed fetch, settlement, commit, or rollback and retains joined causes.
 - `count` is an `int` on the unsupported dead-letter event.
 - `reason` is the fixed string `lock_busy` on skipped maintenance passes.
 - `stage` is a fixed string on failed maintenance passes. Cleanup stages are `connect`, `acquire_lock`,
@@ -74,3 +77,7 @@ the record. The relay rolls back the batch. `Run` reports the worker failure and
 `ProcessOnce` returns the error directly. No committed-outcome counters are incremented for the rollback.
 `WithErrorDetails` opts into persisting handler error text and panic values. Enable it only when these
 values are safe to store. Callback and classifier errors remain original and untruncated.
+
+Storage recovery logs one event per failed polling iteration, including any rollback failure in the same
+`err` chain. It does not emit `relay.worker_failed` unless the worker actually stops with an error.
+Recovery is opt-in through `WithStorageErrorBackoff`; no new logger or metrics methods are required.

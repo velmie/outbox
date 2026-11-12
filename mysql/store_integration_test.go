@@ -14,6 +14,7 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/network"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -490,11 +491,20 @@ func TestStorePendingCountIntegration(t *testing.T) {
 	require.Equal(t, 1, count)
 }
 
-func startMySQLContainer(t *testing.T, ctx context.Context) (testcontainers.Container, *sql.DB) {
+func startMySQLContainer(
+	t *testing.T,
+	ctx context.Context,
+	modifiers ...func(*container.HostConfig),
+) (testcontainers.Container, *sql.DB) {
 	t.Helper()
 	password := rand.Text()
 	port := "3306/tcp"
 	req := testcontainers.ContainerRequest{
+		HostConfigModifier: func(config *container.HostConfig) {
+			for _, modify := range modifiers {
+				modify(config)
+			}
+		},
 		Image:        mysqlImage,
 		ExposedPorts: []string{port},
 		Env: map[string]string{

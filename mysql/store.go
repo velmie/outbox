@@ -254,7 +254,7 @@ func (s *Store) fail(ctx context.Context, tx *sql.Tx, failures []outbox.Failure,
 		attempt++
 		delay, err := s.retryDelay(failure, attempt)
 		if err != nil {
-			return fmt.Errorf("outbox mysql: retry record %s: %w", failure.ID, err)
+			return fmt.Errorf("outbox mysql: retry record %s: %w: %w", failure.ID, outbox.ErrInvalidRetryPolicy, err)
 		}
 		errText := truncateError(failure.Err)
 		args := []any{errText, s.cfg.MaxAttempts, outbox.StatusDead, outbox.StatusPending}

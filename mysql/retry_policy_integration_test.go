@@ -154,6 +154,7 @@ func TestRelayRetryHintPersistsWithGenericError(t *testing.T) {
 	processed, err = unscheduledRelay.ProcessOnce(ctx)
 	require.False(t, processed)
 	require.ErrorContains(t, err, "retry delay requires retry scheduling (next_attempt_at)")
+	require.ErrorIs(t, err, outbox.ErrInvalidRetryPolicy)
 	state = readRetryState(t, ctx, db, unscheduledID)
 	require.Equal(t, outbox.StatusPending, state.status)
 	require.Zero(t, state.attempts)
@@ -176,6 +177,7 @@ func TestRelayRetryHintPersistsWithGenericError(t *testing.T) {
 	)
 	err = unscheduledRelay.Run(ctx)
 	require.ErrorContains(t, err, "retry delay requires retry scheduling (next_attempt_at)")
+	require.ErrorIs(t, err, outbox.ErrInvalidRetryPolicy)
 	require.Equal(t, 1, calls)
 	require.Len(t, logger.errors, 1)
 	require.ErrorContains(t, logger.errors[0], unscheduledID.String())
@@ -227,6 +229,7 @@ func TestRelayRetryHintPersistsWithGenericError(t *testing.T) {
 				RetryDelay: test.hint,
 			}})
 			require.ErrorContains(t, failErr, test.want)
+			require.ErrorIs(t, failErr, outbox.ErrInvalidRetryPolicy)
 			require.NoError(t, batch.Rollback())
 			require.Zero(t, readRetryState(t, ctx, db, id).attempts)
 		})

@@ -101,7 +101,7 @@ caller-owned context directly.
 | Parent canceled or expired, and admitted work finishes | `nil` |
 | Parent already stopped before admission | `nil` |
 | Handler error or panic committed as retry/dead | Processing continues |
-| Fetch, settlement, commit, or rollback failure | Actual failures with their causes |
+| Fetch, settlement, commit, or rollback failure | Actual failures with their causes by default. Opt-in storage recovery retries during normal operation. |
 | Worker panic | Error matching `ErrWorkerPanic`, with panic value or cause |
 | Drain allowance expires | Error wrapping `context.DeadlineExceeded`, joined with actual failures |
 | Immediate mode | Actual failures, without a synthetic drain-timeout error |
@@ -115,6 +115,64 @@ Useful options:
 - `WithFailureClassifier` to decide retry vs dead-letter on errors.
 - `WithLogger` / `WithMetrics` to plug in observability.
 - `WithPendingInterval` to enable pending sampling and set the minimum interval.
+
+### Storage recovery and idle backoff
+
+`WithStorageErrorBackoff(minimum, maximum time.Duration)` enables storage recovery for `Run`.
+Each worker keeps its own wait, starting at `minimum` and doubling after consecutive errors up to `maximum`.
+The wait resets only after an empty fetch (`ErrNoRecords`) or a successfully processed and committed batch.
+A successful fetch followed by a settlement or commit failure grows the wait like any other storage error.
+After failed settlement, the handler runs again after the wait if the record is fetched again. Once the wait
+reaches the maximum, each worker re-processes records no more often than once per maximum interval while
+storage cannot record outcomes. This is a per-worker bound, not a global rate limit across workers or relays.
+A failed worker's wait does not cancel other workers or their handlers. There are no additional goroutines.
+
+The default is disabled. A non-positive minimum disables recovery. A maximum smaller than the minimum is
+raised to the minimum, giving a constant wait. This normalization follows the relay's existing duration defaults.
+`ProcessOnce` continues to return its result immediately, without retrying or sleeping.
+
+During normal operation, recovery applies to errors returned by `Consumer.Fetch`, `Batch.Ack`, `Batch.Fail`,
+`DeadBatch.Dead`, the dead-letter `Fail` fallback, `Batch.Commit`, and cleanup `Batch.Rollback`.
+Rollback failures remain joined to the primary cause. The following failures remain fatal:
+
+- `ErrNilBatch` and `ErrEmptyBatch`: the consumer violated the batch contract.
+- `ErrInvalidBatchSize` and `ErrInvalidID`: invalid input or record identity cannot be repaired by waiting.
+- `ErrInvalidRetryPolicy`: the adapter rejected the scheduling policy. MySQL wraps this sentinel for a positive
+  retry hint without scheduling, a negative hint, or a negative schedule result. The original cause and record ID
+  remain in the error chain. A rollback failure joined to a contract error does not make it recoverable.
+- Worker panics: failures in consumers, batch methods, classifiers, callbacks, or instrumentation remain fatal.
+  Handler errors and recovered handler panics keep the existing per-record retry/dead behavior.
+
+The root relay does not interpret driver-specific error codes or error text. Other errors returned from storage
+methods are treated as storage failures, including persistent database errors such as missing schema or denied
+permissions. Operators must fix these errors; backoff alone does not make them transient. Custom adapters should
+use the relevant root sentinel for contract violations. Use a MySQL adapter containing the
+`ErrInvalidRetryPolicy` classification when enabling recovery; earlier adapters do not expose that distinction.
+
+Before waiting, the relay emits `relay.storage_error` at Error level with the original cause and the proposed
+wait. See [structured diagnostics](diagnostics.md). `WithErrorHandler` remains a handler-failure callback,
+and committed-record metrics are unchanged. Configure `WithLogger` because `NopLogger` discards all events.
+
+After a failed commit, the relay attempts rollback and abandons that batch handle. It does not reuse the old
+transaction or directly replay the in-memory batch. It fetches again after the wait. A commit error can mean
+that the transaction rolled back, or that it committed but confirmation was lost. If it did not commit, eligible
+records can be fetched again and external delivery can repeat. If it committed, settled rows remain processed
+or retain their committed retry/dead state. Rollback is best effort and cannot undo an already committed
+transaction. Use stable `Record.ID` values for idempotency; delivery remains at least once.
+
+`WithIdleBackoff(maximum time.Duration)` independently reduces idle polling. After each empty fetch the worker
+sleeps, initially for `PollInterval`, then doubles that sleep up to the maximum. Fetching records resets it.
+Storage errors do not advance the idle wait. A non-positive maximum disables idle backoff. A positive maximum
+below `PollInterval` is raised to `PollInterval`. Option order does not change these bounds.
+
+The first eligible record after an idle period can wait up to the maximum for the next poll, excluding storage
+and processing time. Each worker still polls independently: idle query rate approaches workers times relays
+divided by the maximum interval. There is no shared poller or notification mechanism.
+
+Both waits are interrupted by parent cancellation or deadline expiry and return `nil` on a clean stop.
+Already admitted work retains the existing shutdown allowance. Once shutdown is observed, failures in that
+work are returned with their causes, and drain timeouts remain errors. Recovery does not start new batches
+during shutdown or hide a failed drain.
 
 ## MySQL adapter details
 

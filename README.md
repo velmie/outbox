@@ -155,6 +155,34 @@ Delivery is at least once: publication may succeed before the relay can acknowle
 and downstream consumers must be idempotent. Publish `Record.ID` as the stable message identifier so downstream
 consumers can deduplicate retries.
 
+### Storage recovery and idle polling
+
+Both behaviors are opt-in and apply only to `Run`:
+
+```go
+relay := outbox.NewRelay(store, handler,
+    outbox.WithLogger(slog.Default()),
+    outbox.WithStorageErrorBackoff(100*time.Millisecond, 5*time.Second),
+    outbox.WithPollInterval(50*time.Millisecond),
+    outbox.WithIdleBackoff(time.Second),
+)
+```
+
+`WithStorageErrorBackoff` lets each worker report a storage error, wait, and fetch again without stopping
+other workers. The wait doubles from the minimum to the maximum and resets only after an empty fetch or a
+successfully processed and committed batch. Contract errors remain fatal. Without the option, storage errors
+still stop `Run`.
+An unsuccessful commit has an uncertain outcome. The relay attempts rollback and fetches a new batch;
+records whose changes did not commit remain eligible and may be delivered again with the same IDs.
+
+`WithIdleBackoff` doubles each worker's sleep after consecutive empty fetches, from `PollInterval` to the
+configured maximum. Fetching records resets it. This reduces idle queries at the cost of up to the maximum
+in added polling latency for the first record after an idle period. Storage recovery and handler time can
+add further delay. Without the option, empty polls retain the fixed `PollInterval`.
+
+See the [relay guide](docs/guide.md#storage-recovery-and-idle-backoff) for error classification, option bounds,
+and shutdown behavior. Configure a logger to observe recovery; the default `NopLogger` discards diagnostics.
+
 ### Shutdown
 
 `Run` stops admitting polling iterations when its parent is canceled or reaches its deadline, or when a worker
@@ -176,7 +204,7 @@ when the caller needs to distinguish its cancellation from its deadline. A drain
 
 ## Defaults
 
-- `Relay`: batch size 50, poll interval 50ms, workers 1.
+- `Relay`: batch size 50, poll interval 50ms, workers 1. Storage recovery and idle backoff are disabled.
 - `MySQL`: table `outbox`, max attempts 5, UUID v7 generator, JSON validation enabled.
 
 ## Durable retry delay
@@ -855,6 +883,7 @@ Reproduce: [docs/benchmarks.md](docs/benchmarks.md).
 The [delivery queue example](examples/delivery/README.md) exercises JetStream admission, MySQL, and HTTP
 delivery against test-owned dependencies.
 
+See [docs/release-next.md](docs/release-next.md) for unreleased changes.
 See [docs/guide.md](docs/guide.md) for architecture, tuning, failure handling, cleanup, and extension notes.
 See [docs/benchmarks.md](docs/benchmarks.md) for the research harness and plotting workflow.
 See [docs/migration-v0.6.0.md](docs/migration-v0.6.0.md) and [docs/release-v0.6.0.md](docs/release-v0.6.0.md)

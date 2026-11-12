@@ -48,7 +48,8 @@ func NewRelay(consumer Consumer, handler Handler, opts ...RelayOption) *Relay {
 }
 
 // Run polls with the configured workers until the parent stops or a worker
-// fails. It stops admitting polls and lets admitted batches finish within the
+// fails. WithStorageErrorBackoff can recover storage failures during normal operation.
+// Run stops admitting polls and lets admitted batches finish within the
 // shared shutdown timeout. Parent cancellation and deadlines request shutdown
 // and return nil if the drain succeeds. Run cancels work when the budget expires
 // and waits for every worker, so handlers and dependencies must cooperate with
@@ -88,7 +89,7 @@ func (r *Relay) Run(ctx context.Context) error {
 				}
 			}()
 
-			if err := r.runWorker(stopCtx, workCtx); err != nil {
+			if err := r.runWorker(stopCtx, workCtx, workerID); err != nil {
 				workerErr = err
 				stop()
 				r.cfg.Logger.Error("outbox worker error",
@@ -161,33 +162,74 @@ type batchOutcome struct {
 	dead       []Failure
 }
 
-func (r *Relay) runWorker(stopCtx, workCtx context.Context) error {
-	for {
-		select {
-		case <-stopCtx.Done():
-			return nil
-		default:
-		}
-
+func (r *Relay) runWorker(stopCtx, workCtx context.Context, workerID int) error {
+	storageWait := r.cfg.StorageErrorBackoffMin
+	idleWait := r.cfg.PollInterval
+	for stopCtx.Err() == nil {
 		batch, err := r.fetchBatch(workCtx)
-		if err != nil {
-			if errors.Is(err, ErrNoRecords) {
-				r.maybeRecordPending(stopCtx)
-				if !r.sleep(stopCtx, r.cfg.PollInterval) {
-					return nil
-				}
-
-				continue
+		operation := "relay.fetch"
+		if errors.Is(err, ErrNoRecords) {
+			storageWait = r.cfg.StorageErrorBackoffMin
+			r.maybeRecordPending(stopCtx)
+			if !r.sleep(stopCtx, idleWait) {
+				return nil
 			}
+			idleWait = growWait(idleWait, r.cfg.IdleBackoffMax)
 
-			return fmt.Errorf("outbox fetch failed: %w", err)
+			continue
 		}
+		if err == nil {
+			idleWait = r.cfg.PollInterval
+			operation = "relay.process_batch"
+			err = r.processBatch(workCtx, batch)
+		} else {
+			err = fmt.Errorf("outbox fetch failed: %w", err)
+		}
+		if err != nil {
+			if storageWait <= 0 || stopCtx.Err() != nil || workCtx.Err() != nil || isRelayContractError(err) {
+				return err
+			}
+			r.cfg.Logger.Error(
+				"outbox storage error; polling will resume",
+				"event",
+				"relay.storage_error",
+				"operation",
+				operation,
+				"outcome",
+				"retrying",
+				"worker",
+				workerID,
+				"retry_in",
+				storageWait,
+				"err",
+				err,
+			)
+			if !r.sleep(stopCtx, storageWait) {
+				return nil
+			}
+			storageWait = growWait(storageWait, r.cfg.StorageErrorBackoffMax)
 
-		if err := r.processBatch(workCtx, batch); err != nil {
-			return err
+			continue
 		}
+		storageWait = r.cfg.StorageErrorBackoffMin
 		r.maybeRecordPending(stopCtx)
 	}
+
+	return nil
+}
+
+func growWait(current, maximum time.Duration) time.Duration {
+	if current >= maximum-current {
+		return maximum
+	}
+
+	return current + current
+}
+
+func isRelayContractError(err error) bool {
+	return errors.Is(err, ErrNilBatch) || errors.Is(err, ErrEmptyBatch) ||
+		errors.Is(err, ErrInvalidBatchSize) || errors.Is(err, ErrInvalidRetryPolicy) ||
+		errors.Is(err, ErrInvalidID)
 }
 
 func (r *Relay) fetchBatch(ctx context.Context) (Batch, error) {

@@ -15,6 +15,12 @@ type RelayConfig struct {
 	BatchSize    int
 	PollInterval time.Duration
 	Workers      int
+	// StorageErrorBackoffMin enables storage recovery when positive.
+	StorageErrorBackoffMin time.Duration
+	// StorageErrorBackoffMax caps the per-worker storage recovery wait.
+	StorageErrorBackoffMax time.Duration
+	// IdleBackoffMax caps empty-poll waits. Zero keeps PollInterval fixed.
+	IdleBackoffMax time.Duration
 	// PartitionWindow is retained for source compatibility and is ignored.
 	//
 	// Deprecated: all pending records are eligible for delivery.
@@ -53,10 +59,38 @@ func WithBatchSize(size int) RelayOption {
 	}
 }
 
-// WithPollInterval sets the delay between empty polls.
+// WithPollInterval sets the initial delay between empty polls.
+// The delay stays fixed unless WithIdleBackoff is enabled.
 func WithPollInterval(interval time.Duration) RelayOption {
 	return func(c *RelayConfig) {
 		c.PollInterval = interval
+	}
+}
+
+// WithStorageErrorBackoff keeps Run workers polling after storage errors.
+// Each worker waits minimum after an error, doubling up to maximum on repeated failures.
+// Only an empty fetch or a successfully processed and committed batch resets the wait.
+// After failed settlement or commit, the handler runs again after the wait if the
+// record is fetched again. At maximum backoff, reprocessing is no more frequent
+// than once per maximum interval per worker while storage cannot record outcomes.
+// Contract errors remain fatal. Recovery is disabled by default or when minimum is non-positive.
+// A maximum below minimum is raised to minimum. ProcessOnce is unaffected.
+// Errors are reported through the configured Logger before waiting.
+func WithStorageErrorBackoff(minimum, maximum time.Duration) RelayOption {
+	return func(c *RelayConfig) {
+		c.StorageErrorBackoffMin = minimum
+		c.StorageErrorBackoffMax = maximum
+	}
+}
+
+// WithIdleBackoff doubles each worker's empty-poll wait from PollInterval to maximum.
+// Fetching records resets the wait. A non-positive maximum disables backoff (the
+// default), and a positive maximum below PollInterval is raised to PollInterval.
+// The maximum bounds added polling latency after an idle period, excluding
+// storage and handler time. ProcessOnce is unaffected.
+func WithIdleBackoff(maximum time.Duration) RelayOption {
+	return func(c *RelayConfig) {
+		c.IdleBackoffMax = maximum
 	}
 }
 
@@ -145,6 +179,12 @@ func (c RelayConfig) withDefaults() RelayConfig {
 	}
 	if c.PollInterval <= 0 {
 		c.PollInterval = defaultPollInterval
+	}
+	if c.StorageErrorBackoffMax < c.StorageErrorBackoffMin {
+		c.StorageErrorBackoffMax = c.StorageErrorBackoffMin
+	}
+	if c.IdleBackoffMax < c.PollInterval {
+		c.IdleBackoffMax = c.PollInterval
 	}
 	if c.Workers <= 0 {
 		c.Workers = defaultWorkers
