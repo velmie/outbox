@@ -6,8 +6,8 @@ require (
 	github.com/moby/moby/api v1.55.0
 	github.com/stretchr/testify v1.12.1
 	github.com/testcontainers/testcontainers-go v0.44.0
-	github.com/velmie/outbox v0.6.0
-	github.com/velmie/outbox/mysql v0.6.0
+	github.com/velmie/outbox v0.7.0
+	github.com/velmie/outbox/mysql v0.7.0
 )
 
 require (
